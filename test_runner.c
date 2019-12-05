@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+#include <sys/epoll.h>
 
 #include "glr.h"
 
@@ -126,7 +129,7 @@ static void test_body_transient_allocator(glr_allocator_t *alloc) {
 }
 
 static void test_transient_allocator() {
-  glr_allocator_t alloc = glr_get_transient_allocator();
+  glr_allocator_t alloc = glr_get_transient_allocator(NULL);
 
   test_body_transient_allocator(&alloc);
 
@@ -144,7 +147,7 @@ static void test_transient_allocator2() {
   //resetting allocator, request allocating of 8192, 0th block would not be able
   //to contain this data as 1st, so it should allocated 8192 block and swap it
   //with 1st
-  glr_allocator_t alloc = glr_get_transient_allocator();
+  glr_allocator_t alloc = glr_get_transient_allocator(NULL);
 
   glr_allocator_alloc(&alloc, 4096, 1);
   glr_allocator_alloc(&alloc, 4096, 1);
@@ -160,7 +163,7 @@ static void test_transient_allocator2() {
 }
 
 static void test_glr_sprintf() {
-  glr_allocator_t a = glr_get_transient_allocator();
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
 
   printf("%s:%d:%s Float=%.6f'\n", __FILE__, __LINE__, __func__, 123.45);
 
@@ -188,7 +191,7 @@ static void test_allocators_stack() {
     abort();
   }
 
-  glr_allocator_t a1 = glr_get_transient_allocator();
+  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   glr_allocator_t *cur = glr_current_allocator();
@@ -208,7 +211,7 @@ static void test_allocators_stack() {
 }
 
 static void test_stringbuilder() {
-  glr_allocator_t a1 = glr_get_transient_allocator();
+  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   stringbuilder_t sb = glr_make_stringbuilder(256);
@@ -229,7 +232,7 @@ static void test_stringbuilder() {
 }
 
 static void test_stringbuilder2() {
-  glr_allocator_t a1 = glr_get_transient_allocator();
+  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   stringbuilder_t sb = glr_make_stringbuilder(5);
@@ -253,7 +256,7 @@ static void test_stringbuilder2() {
 static void test_stringbuilder3() {
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   //testing append
-  glr_allocator_t a1 = glr_get_transient_allocator();
+  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   const char str[] = "'Hello World'";
@@ -335,7 +338,7 @@ static void bench_snprintf_len_calculation2() {
   clock_gettime(CLOCK_MONOTONIC, &start);
   int n = 10000;
   for (int i = 0; i < n; ++i) {
-    (void)snprintf(NULL, 0, "String='%*s' int='%d' float='%f'\n",
+    (void)snprintf(NULL, 0, "String='%.*s' int='%d' float='%f'\n",
                    11, "Hello world", 12345, 987.654);
   }
   struct timespec end;
@@ -456,6 +459,161 @@ static void test_scheduler_execution() {
   glr_cur_thread_runtime_cleanup();
 }
 
+void poll_test_coro(void *arg) {
+  uintptr_t large_fd = (uintptr_t) arg;
+  int fd = large_fd;
+  int64_t add = 5;
+  int rc = write(fd, &add, 8);
+  if (rc != 8) {
+    abort();
+  }
+}
+
+static void test_poll() {
+  err_t err = {};
+  int fd = eventfd(0, EFD_NONBLOCK);
+  uintptr_t large_fd = fd;
+  glr_go(poll_test_coro, (void *)large_fd);
+  int rc = glr_wait_for(fd, EPOLLIN|EPOLLET, &err);
+
+  int64_t new_val = 0;
+  rc = read(fd, &new_val, 8);
+  if (rc == -1) {
+    abort();
+  }
+  if (new_val != 5) {
+    abort();
+  }
+
+  close(fd);
+  glr_cur_thread_runtime_cleanup();
+  err_cleanup(&err);
+}
+
+static void test_error_handling() {
+  err_t err = {};
+  int fd = 1213456;
+  glr_wait_for(fd, EPOLLIN|EPOLLET, &err);
+  if (err.error) {
+    str_t msg = glr_stringbuilder_build(&err.msg);
+    printf("Expected error: %*s\n", msg.len, msg.data);
+    glr_free(msg.data);
+  } else {
+    abort();
+  }
+
+  glr_cur_thread_runtime_cleanup();
+  err_cleanup(&err);
+}
+
+static void test_transient_allocator_embedding() {
+  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a1);
+
+  glr_allocator_t a2 = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a2);
+
+  stringbuilder_t sb = {};
+  glr_stringbuilder_printf(&sb, "%s", "Hello world");
+  str_t s = glr_stringbuilder_build(&sb);
+  printf("Built string: %.*s\n", s.len, s.data);
+
+  glr_pop_allocator();
+  glr_pop_allocator();
+  glr_destroy_allocator(&a1);
+}
+
+static void bench_transient_allocation() {
+  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a1);
+
+  printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  int n = 10000;
+  for (int i = 0; i < n; ++i) {
+    (void)glr_malloc(1, 1);
+  }
+  struct timespec end;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  int64_t elapsed = (end.tv_sec - start.tv_sec) * 1e9 +
+      (end.tv_nsec - start.tv_nsec);
+  printf("transient malloc: %d iterations took = %f secs\n",
+         n, elapsed / 1e9);
+
+  glr_pop_allocator();
+  glr_destroy_allocator(&a1);
+}
+
+struct test_timers_data {
+  int *arr;
+  int *len;
+  int cap;
+  int idx;
+  glr_exec_context_t *main_ctx;
+};
+
+static void test_timers_coro(glr_timer_t *t) {
+  struct test_timers_data *td = t->arg;
+  td->arr[(*td->len)++] = td->idx;
+  printf("Timer #%d fired (%d/%d)\n", td->idx, *td->len, td->cap);
+  if (*td->len == td->cap) {
+    glr_scheduler_add(td->main_ctx);
+  }
+}
+
+static void test_timers() {
+  glr_exec_context_t *cur = glr_current_context();
+  int execution_order[10] = {};
+  int len = 0;
+  int timeouts[10];
+  timeouts[0] = 130;
+  timeouts[1] = 150;
+  timeouts[2] = 170;
+  timeouts[3] = 190;
+  timeouts[4] = 200;
+  timeouts[5] = 180;
+  timeouts[6] = 160;
+  timeouts[7] = 140;
+  timeouts[8] = 120;
+  timeouts[9] = 110;
+
+  struct test_timers_data td[10] = {};
+  glr_timer_t timers[10] = {};
+
+  int64_t now = glr_timestamp_in_ms();
+  for (int i = 0; i < 10; ++i) {
+    td[i].arr = execution_order;
+    td[i].len = &len;
+    td[i].cap = sizeof(execution_order)/sizeof(execution_order[0]);
+    td[i].idx = i;
+    td[i].main_ctx = cur;
+    timers[i].arg = td + i;
+    timers[i].callback = test_timers_coro;
+    timers[i].deadline_posix_milliseconds = now + timeouts[i];
+    glr_add_timer(timers + i);
+  }
+
+  printf("launching timers\n");
+  glr_scheduler_yield(0);
+
+#define CHECK(cond) if (!(cond)) abort();
+  CHECK(execution_order[0] == 9);
+  CHECK(execution_order[1] == 8);
+  CHECK(execution_order[2] == 0);
+  CHECK(execution_order[3] == 7);
+  CHECK(execution_order[4] == 1);
+  CHECK(execution_order[5] == 6);
+  CHECK(execution_order[6] == 2);
+  CHECK(execution_order[7] == 5);
+  CHECK(execution_order[8] == 3);
+  CHECK(execution_order[9] == 4);
+#undef CHECK
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+
 int main() {
   label_pointers();
   error_handling();
@@ -476,4 +634,9 @@ int main() {
   test_scheduler();
   test_scheduler_resizing();
   test_scheduler_execution();
+  test_poll();
+  test_error_handling();
+  test_transient_allocator_embedding();
+  bench_transient_allocation();
+  test_timers();
 }

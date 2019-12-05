@@ -26,7 +26,7 @@ void glr_reset_allocator(glr_allocator_t *a);
 void glr_destroy_allocator(glr_allocator_t *a);
 
 glr_allocator_t glr_get_default_allocator();
-glr_allocator_t glr_get_transient_allocator();
+glr_allocator_t glr_get_transient_allocator(glr_allocator_t *parent);
 
 typedef struct {
   void *data;
@@ -43,8 +43,8 @@ str_t glr_sprintf(glr_allocator_t *a, const char *format, ...)
   __attribute__((format(printf, 2, 3)));
 
 void glr_push_allocator(glr_allocator_t *a);
-glr_allocator_t* glr_pop_allocator();
-glr_allocator_t* glr_current_allocator();
+glr_allocator_t* glr_pop_allocator(void);
+glr_allocator_t* glr_current_allocator(void);
 
 void *glr_malloc(size_t size, size_t alignment);
 #define GLR_ALLOCATE_TYPE(T) ((T*) glr_malloc(sizeof(T), alignof(T)))
@@ -103,5 +103,48 @@ void glr_cur_thread_runtime_cleanup();
 
 void glr_scheduler_add(glr_exec_context_t *ctx);
 void glr_scheduler_yield(int reschedule_current_ctx);
+
+//error handling
+
+enum {
+  ERROR_NONE = 0,
+};
+
+typedef struct {
+  int error;
+  stringbuilder_t msg;
+} err_t;
+
+void err_cleanup(err_t *err);
+
+//networking
+int64_t glr_timestamp_in_ms();
+
+typedef struct glr_poll_t {
+  int32_t fd;
+  uint32_t last_epoll_event_bitset;
+  void (*cb)(struct glr_poll_t *);
+  void *cb_arg;
+} glr_poll_t;
+
+enum {
+  ERROR_FAILED_EPOLL_CTL=1,
+  ERROR_INVALID_ARG=2,
+};
+void glr_add_poll(glr_poll_t *poll, int flags, err_t *err);
+void glr_change_poll(glr_poll_t *poll, int flags, err_t *err);
+void glr_remove_poll(glr_poll_t *poll, err_t *err);
+int glr_wait_for(int fd, uint32_t flags, err_t *err);
+
+typedef struct glr_timer_t {
+  int64_t deadline_posix_milliseconds;
+  void *arg;
+  void (*callback)(struct glr_timer_t *timer);
+  int32_t internal_idx;
+} glr_timer_t;
+
+void glr_add_timer(glr_timer_t *timer);
+void glr_remove_timer(glr_timer_t *timer);
+
 
 #endif //GLR_H
