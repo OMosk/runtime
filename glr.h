@@ -48,6 +48,7 @@ glr_allocator_t* glr_current_allocator(void);
 
 void *glr_malloc(size_t size, size_t alignment);
 #define GLR_ALLOCATE_TYPE(T) ((T*) glr_malloc(sizeof(T), alignof(T)))
+#define GLR_ALLOCATE_ARRAY(T, n) ((T*) glr_malloc(sizeof(T)*n, alignof(T)))
 void glr_free(void *data);
 
 typedef struct {
@@ -68,17 +69,6 @@ void glr_stringbuilder_append(stringbuilder_t *sb, const char *data, size_t len)
 str_t glr_stringbuilder_build(stringbuilder_t *sb);
 void glr_stringbuilder_reset(stringbuilder_t *sb);
 void glr_stringbuilder_free_buffers(stringbuilder_t *sb);
-
-typedef struct glr_freelist_node_s {
-  void *data;
-  struct glr_freelit_node_s *next;
-} glr_freelist_node_t;
-
-typedef struct {
-  glr_freelist_node_t *top;
-} glr_freelist_t;
-void glr_freelist_put(glr_freelist_t *fl, void *data);
-void *glr_freelist_get(glr_freelist_t *fl);
 
 //coroutines
 
@@ -145,6 +135,15 @@ typedef struct glr_timer_t {
 
 void glr_add_timer(glr_timer_t *timer);
 void glr_remove_timer(glr_timer_t *timer);
+
+typedef void (*glr_job_fn_t)(void *);
+typedef struct glr_runtime_t glr_runtime_t;
+
+glr_runtime_t *glr_cur_thread_runtime();
+
+void glr_async_post(glr_runtime_t *r, glr_job_fn_t fn, void *arg);
+
+void glr_run_in_thread_pool(glr_job_fn_t fn, void *arg);
 
 
 #endif //GLR_H

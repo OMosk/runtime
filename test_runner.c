@@ -9,10 +9,15 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include "glr.h"
 
+#define TEST printf("%s:%d:%s started\n", __FILE__, __LINE__, __func__)
+
 static void label_pointers(void) {
+  TEST;
   int a = 0;
   void *label_ptr = &&my_label;
   goto *label_ptr;
@@ -26,6 +31,7 @@ my_label:
 }
 
 static void error_handling(void) {
+  TEST;
   void *cleanup = &&exit;
 
   int *a = (int*) malloc(sizeof(int));
@@ -61,6 +67,7 @@ exit:
 }
 
 static void test_global_malloc_free_adapter() {
+  TEST;
   glr_allocator_t global = glr_get_default_allocator();
   int *a = (int *) glr_allocator_alloc(&global, sizeof(int), alignof(int));
   *a = 5;
@@ -70,6 +77,7 @@ static void test_global_malloc_free_adapter() {
 }
 
 static void test_body_transient_allocator(glr_allocator_t *alloc) {
+  TEST;
   typedef struct {
     uint32_t field1;
     uint64_t field2;
@@ -129,6 +137,7 @@ static void test_body_transient_allocator(glr_allocator_t *alloc) {
 }
 
 static void test_transient_allocator() {
+  TEST;
   glr_allocator_t alloc = glr_get_transient_allocator(NULL);
 
   test_body_transient_allocator(&alloc);
@@ -142,6 +151,7 @@ static void test_transient_allocator() {
 }
 
 static void test_transient_allocator2() {
+  TEST;
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   //Allocating in way that forces transient allocator allocate 3 4096 blocks
   //resetting allocator, request allocating of 8192, 0th block would not be able
@@ -163,6 +173,7 @@ static void test_transient_allocator2() {
 }
 
 static void test_glr_sprintf() {
+  TEST;
   glr_allocator_t a = glr_get_transient_allocator(NULL);
 
   printf("%s:%d:%s Float=%.6f'\n", __FILE__, __LINE__, __func__, 123.45);
@@ -211,6 +222,7 @@ static void test_allocators_stack() {
 }
 
 static void test_stringbuilder() {
+  TEST;
   glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
@@ -232,6 +244,7 @@ static void test_stringbuilder() {
 }
 
 static void test_stringbuilder2() {
+  TEST;
   glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
@@ -254,6 +267,7 @@ static void test_stringbuilder2() {
 }
 
 static void test_stringbuilder3() {
+  TEST;
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   //testing append
   glr_allocator_t a1 = glr_get_transient_allocator(NULL);
@@ -286,6 +300,7 @@ static void test_stringbuilder3() {
 }
 
 static void test_stringbuilder4() {
+  TEST;
   //Test buffers cleanup
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   stringbuilder_t sb = glr_make_stringbuilder(5);
@@ -300,6 +315,7 @@ static void test_stringbuilder4() {
 }
 
 static void bench_emptysnprintf_len_calculation() {
+  TEST;
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
@@ -354,6 +370,7 @@ typedef struct {
 } coro_transfer_test_data;
 
 static void test_coro_func(void *arg) {
+  TEST;
   coro_transfer_test_data *tdata = arg;
   tdata->called = 1;
   printf("coro was executed\n");
@@ -361,6 +378,7 @@ static void test_coro_func(void *arg) {
 }
 
 static void test_coro_transfer() {
+  TEST;
   coro_transfer_test_data tdata = { glr_current_context(), 0};
   glr_exec_context_t *coro_ctx = glr_get_context_from_freelist();
   glr_create_coro(coro_ctx, test_coro_func, &tdata);
@@ -375,6 +393,7 @@ static void test_coro_transfer() {
 }
 
 static void test_coro_func2(void *arg) {
+  TEST;
   coro_transfer_test_data *tdata = arg;
   tdata->called = 1;
   printf("coro was executed\n");
@@ -382,6 +401,7 @@ static void test_coro_func2(void *arg) {
 }
 
 static void test_scheduler() {
+  TEST;
   coro_transfer_test_data tdata = { glr_current_context(), 0};
   glr_go(test_coro_func2, &tdata);
   glr_scheduler_yield(1);
@@ -395,11 +415,13 @@ static void test_scheduler() {
 }
 
 static void test_coro_func3(void *arg) {
+  TEST;
   coro_transfer_test_data *tdata = arg;
   tdata->called++;
 }
 
 static void test_scheduler_resizing() {
+  TEST;
   coro_transfer_test_data tdata = { glr_current_context(), 0};
   glr_go(test_coro_func3, &tdata);
   glr_go(test_coro_func3, &tdata);
@@ -434,6 +456,7 @@ static void test_coro_func4(void *arg) {
 }
 
 static void test_scheduler_execution() {
+  TEST;
   //to mess with indexes in scheduler ring buffer
   coro_transfer_test_data tdata = { glr_current_context(), 0};
   glr_go(test_coro_func3, &tdata);
@@ -463,6 +486,7 @@ void poll_test_coro(void *arg) {
   uintptr_t large_fd = (uintptr_t) arg;
   int fd = large_fd;
   int64_t add = 5;
+  printf("Written to fd=%d\n", fd);
   int rc = write(fd, &add, 8);
   if (rc != 8) {
     abort();
@@ -470,8 +494,10 @@ void poll_test_coro(void *arg) {
 }
 
 static void test_poll() {
+  TEST;
   err_t err = {};
   int fd = eventfd(0, EFD_NONBLOCK);
+  printf("Inited fd=%d\n", fd);
   uintptr_t large_fd = fd;
   glr_go(poll_test_coro, (void *)large_fd);
   int rc = glr_wait_for(fd, EPOLLIN|EPOLLET, &err);
@@ -491,6 +517,7 @@ static void test_poll() {
 }
 
 static void test_error_handling() {
+  TEST;
   err_t err = {};
   int fd = 1213456;
   glr_wait_for(fd, EPOLLIN|EPOLLET, &err);
@@ -507,6 +534,7 @@ static void test_error_handling() {
 }
 
 static void test_transient_allocator_embedding() {
+  TEST;
   glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
@@ -524,6 +552,7 @@ static void test_transient_allocator_embedding() {
 }
 
 static void bench_transient_allocation() {
+  TEST;
   glr_allocator_t a1 = glr_get_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
@@ -554,6 +583,7 @@ struct test_timers_data {
 };
 
 static void test_timers_coro(glr_timer_t *t) {
+  TEST;
   struct test_timers_data *td = t->arg;
   td->arr[(*td->len)++] = td->idx;
   printf("Timer #%d fired (%d/%d)\n", td->idx, *td->len, td->cap);
@@ -563,6 +593,7 @@ static void test_timers_coro(glr_timer_t *t) {
 }
 
 static void test_timers() {
+  TEST;
   glr_exec_context_t *cur = glr_current_context();
   int execution_order[10] = {};
   int len = 0;
@@ -613,6 +644,260 @@ static void test_timers() {
   glr_cur_thread_runtime_cleanup();
 }
 
+static void allocator_use_coro(void *arg) {
+  (void) arg;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  glr_scheduler_yield(1);
+
+  if (glr_current_allocator() != &a) {
+    abort();
+  }
+
+  glr_pop_allocator();
+  glr_destroy_allocator(&a);
+}
+
+static void test_allocator_preserving_between_coros() {
+  TEST;
+  glr_go(allocator_use_coro, 0);
+  glr_go(allocator_use_coro, 0);
+  glr_scheduler_yield(1);
+  glr_scheduler_yield(1);
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+typedef struct {
+  glr_runtime_t *r;
+  glr_exec_context_t *ctx;
+} async_test_data;
+
+void test_async1_job_fn(void *arg) {
+  glr_scheduler_add(arg);
+}
+
+void *test_async1_thread_fn(void *arg) {
+  async_test_data *td = arg;
+  glr_async_post(td->r, test_async1_job_fn, td->ctx);
+  return NULL;
+}
+
+static void test_async1() {
+  TEST;
+
+  async_test_data td = {glr_cur_thread_runtime(), glr_current_context()};
+
+  pthread_t pt;
+  if (pthread_create(&pt, NULL, test_async1_thread_fn, &td)) {
+    abort();
+  }
+  glr_scheduler_yield(0);
+  if (pthread_join(pt, NULL)) {
+    abort();
+  }
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+typedef struct {
+  int n;
+  int called;
+  glr_runtime_t *r;
+  glr_exec_context_t *ctx;
+} async_test2_data;
+
+void test_async2_job_fn(void *arg) {
+  async_test2_data *td = arg;
+  if (++td->called == td->n) {
+    glr_scheduler_add(td->ctx);
+  }
+}
+
+void *test_async2_thread_fn(void *arg) {
+  async_test2_data *td = arg;
+  for (int i = 0; i < td->n; ++i) {
+    glr_async_post(td->r, test_async2_job_fn, td);
+  }
+  return NULL;
+}
+
+
+static void test_async2(int n) {
+  TEST;
+
+  async_test2_data td = {n, 0, glr_cur_thread_runtime(), glr_current_context()};
+
+  int64_t begin = glr_timestamp_in_ms();
+  pthread_t pt;
+  if (pthread_create(&pt, NULL, test_async2_thread_fn, &td)) {
+    abort();
+  }
+  glr_scheduler_yield(0);
+  if (pthread_join(pt, NULL)) {
+    abort();
+  }
+  int64_t end = glr_timestamp_in_ms();
+  printf("Test for %d (%d) asyncs took %ld ms\n", td.n, td.called, end-begin);
+  if (td.n != td.called) {
+    abort();
+  }
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+void *test_async3_thread_fn(void *arg) {
+  async_test2_data *td = arg;
+  struct timespec req = {};
+  for (int i = 0; i < td->n; ++i) {
+    glr_async_post(td->r, test_async2_job_fn, td);
+    req.tv_nsec = (i % 1000) * 10;
+    nanosleep(&req, NULL);
+  }
+  return NULL;
+}
+
+
+static void test_async3(int n) {
+  TEST;
+
+  async_test2_data td = {n, 0, glr_cur_thread_runtime(), glr_current_context()};
+
+  int64_t begin = glr_timestamp_in_ms();
+  pthread_t pt;
+  if (pthread_create(&pt, NULL, test_async3_thread_fn, &td)) {
+    abort();
+  }
+  glr_scheduler_yield(0);
+  if (pthread_join(pt, NULL)) {
+    abort();
+  }
+  int64_t end = glr_timestamp_in_ms();
+  printf("Test for %d (%d) asyncs took %ld ms\n", td.n, td.called, end-begin);
+  if (td.n != td.called) {
+    abort();
+  }
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+typedef struct {
+  int64_t *sum;
+  int64_t number;
+} async_test4_data;
+
+static void test_async4_job_fn(void *arg) {
+  async_test4_data *td = arg;
+  *td->sum += td->number;
+}
+
+static void test_async4() {
+  TEST;
+
+  int64_t sum = 0;
+
+  async_test4_data td[1000];
+  for (int i = 0; i < 1000; ++i) {
+    td[i].sum = &sum;
+    td[i].number = i;
+    glr_async_post(glr_cur_thread_runtime(), test_async4_job_fn, td + i);
+  }
+
+  glr_scheduler_yield(1);
+
+  if (sum != (0. + 999.) / 2. * 1000.) {
+    abort();
+  }
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+typedef struct {
+  int64_t *sum;
+  int64_t number;
+  int64_t expected;
+  int called;
+  int should_be_called;
+  glr_exec_context_t *ctx;
+} async_test5_job_data;
+
+int test_async5_called;
+static void test_async5_job_fn(void *arg) {
+  test_async5_called++;
+  async_test5_job_data *data = arg;
+  data->called++;
+  *data->sum += data->number;
+  if (data->expected == *data->sum) {
+    glr_scheduler_add(data->ctx);
+  }
+  if (data->called > data->should_be_called) {
+    abort();
+  }
+//  if (test_async5_called % 10000 == 0) {
+//    printf("%s called %d times(exp=%ld cur=%ld)\n", __func__, test_async5_called,
+//           data->expected, *data->sum);
+//  }
+}
+
+typedef struct {
+  async_test5_job_data *arr;
+  int arr_len;
+  glr_runtime_t *r;
+  pthread_t pthread;
+} async_test5_thread_data;
+
+static void *test_async5_thread_fn(void *arg) {
+  async_test5_thread_data *data = arg;
+  for (int i = 0; i < data->arr_len; ++i) {
+    glr_async_post(data->r, test_async5_job_fn, data->arr + i);
+  }
+  return NULL;
+}
+
+static void test_async5(int n) {
+  test_async5_called = 0;
+  TEST;
+
+  int64_t sum = 0;
+  int threads = 3;
+  int64_t expected_sum = threads * (0. + (double)(n-1)) / 2. * n;
+  glr_exec_context_t *main_ctx = glr_current_context();
+  async_test5_job_data *job_data = GLR_ALLOCATE_ARRAY(async_test5_job_data, n);
+  for (int i = 0; i < n; ++i) {
+    job_data[i].sum = &sum;
+    job_data[i].number = i;
+    job_data[i].expected = expected_sum;
+    job_data[i].ctx = main_ctx;
+    job_data[i].called = 0;
+    job_data[i].should_be_called = threads;
+  }
+
+  async_test5_thread_data thread_data[threads];
+  for (int i = 0; i < threads; ++i) {
+    thread_data[i].arr = job_data;
+    thread_data[i].arr_len = n;
+    thread_data[i].r = glr_cur_thread_runtime();
+  }
+
+  int64_t begin = glr_timestamp_in_ms();
+  for (int i = 0; i < threads; ++i) {
+    if (pthread_create(&thread_data[i].pthread, NULL, test_async5_thread_fn, thread_data + i)) {
+      abort();
+    }
+  }
+  glr_scheduler_yield(0);
+  for (int i = 0; i < threads; ++i) {
+    if (pthread_join(thread_data[i].pthread, NULL)) {
+      abort();
+    }
+  }
+
+  int64_t end = glr_timestamp_in_ms();
+  printf("Test for %d asyncs from %d threads took %ld ms\n", n*threads, threads, end-begin);
+
+  glr_cur_thread_runtime_cleanup();
+
+}
 
 int main() {
   label_pointers();
@@ -639,4 +924,20 @@ int main() {
   test_transient_allocator_embedding();
   bench_transient_allocation();
   test_timers();
+  test_allocator_preserving_between_coros();
+  test_async1();
+  for (int i = 0; i < 100; ++i) {
+    test_async2(10000);
+  }
+  for (int i = 0; i < 100; ++i) {
+    test_async2(100000);
+  }
+  for (int i = 0; i < 10; ++i) {
+    test_async3(10000);
+  }
+  test_async4();
+  for (int i = 0; i < 100; ++i) {
+    test_async5(100000);
+  }
+
 }

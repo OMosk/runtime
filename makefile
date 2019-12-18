@@ -1,6 +1,9 @@
 COV_FLAGS:=-fprofile-instr-generate -fcoverage-mapping
+ADDITIONAL_CHECKS:=-Wall -Wextra #-Werror
+CFLAGS:=$(ADDITIONAL_CHECKS) $(COV_FLAGS) -march=native -pthread
+#CFLAGS:=$(ADDITIONAL_CHECKS) -O3 -march=native -pthread
 b:
-	time clang -g -O0 $(COV_FLAGS) all.c -o test
+	time clang -g $(CFLAGS) all.c -o test
 
 cov:
 	llvm-profdata merge -sparse default.profraw -o default.profdata

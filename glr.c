@@ -8,6 +8,9 @@
 #include <sys/mman.h>
 #include <sys/epoll.h>
 #include <sys/time.h>
+#include <sys/eventfd.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <errno.h>
 
 //Features
@@ -32,9 +35,17 @@ struct glr_exec_stack_t {
 struct glr_exec_context_t {
   void **sp;
   glr_exec_stack_t *stack;
+  glr_allocator_t *saved_allocator;
 };
 
 typedef struct {
+  glr_job_fn_t fn;
+  void *arg;
+} job_t;
+
+typedef _Atomic job_t atomic_job_t;
+
+typedef struct glr_runtime_t {
   glr_exec_context_t *cur_context;
 
   //works as ringbuffer
@@ -48,14 +59,13 @@ typedef struct {
   uint32_t free_contexts_len;
   uint32_t free_contexts_cap;
 
-
   glr_coro_func_t new_coro_func;
   void *new_coro_arg;
 
   glr_exec_context_t *new_coro_context;
   glr_exec_context_t *creator_context;
 
-  uint32_t epoll_inited;
+  uint32_t event_loop_inited;
   uint32_t epoll_fd;
   glr_exec_context_t *event_loop_ctx;
 
@@ -64,14 +74,21 @@ typedef struct {
   uint32_t timers_cap;
   uint32_t timers_len;
 
-
   glr_exec_context_t thread_context;
   glr_allocator_t *current_allocator;
   glr_allocator_t cached_default_allocator;
-} glr_coro_runtime_t;
+
+  atomic_job_t *async_jobs_ringbuffer;
+  uint32_t async_jobs_ringbuffer_cap;
+  _Atomic uint32_t async_jobs_r_idx;
+  _Atomic uint32_t async_jobs_w_idx;
+  _Atomic uint32_t async_woken_up;
+  glr_poll_t async_eventfd_poll;
+
+} glr_runtime_t;
 
 //static thread_local glr_exec_context_t thread_context;
-static thread_local glr_coro_runtime_t glr_coro_runtime;
+static thread_local glr_runtime_t glr_runtime;
 
 // Global malloc/free allocator
 void *glr_malloc_free_adapter(void *data, int op, size_t size, size_t alignment, void *ptr) {
@@ -255,26 +272,25 @@ void glr_destroy_allocator(glr_allocator_t *a) {
 }
 
 void glr_push_allocator(glr_allocator_t *a) {
-  a->next = glr_coro_runtime.current_allocator;
-  glr_coro_runtime.current_allocator = a;
+  a->next = glr_runtime.current_allocator;
+  glr_runtime.current_allocator = a;
 }
 
 glr_allocator_t* glr_pop_allocator() {
-  glr_allocator_t *result = glr_coro_runtime.current_allocator;
-  glr_coro_runtime.current_allocator = glr_coro_runtime.current_allocator->next;
+  glr_allocator_t *result = glr_runtime.current_allocator;
+  glr_runtime.current_allocator = glr_runtime.current_allocator->next;
   return result;
 }
 
 glr_allocator_t* glr_current_allocator() {
-  if (!glr_coro_runtime.current_allocator) {
-    if (!glr_coro_runtime.cached_default_allocator.func) {
-      glr_coro_runtime.cached_default_allocator = glr_get_default_allocator();
+  if (!glr_runtime.current_allocator) {
+    if (!glr_runtime.cached_default_allocator.func) {
+      glr_runtime.cached_default_allocator = glr_get_default_allocator();
     }
-    glr_coro_runtime.current_allocator =
-        &glr_coro_runtime.cached_default_allocator;
+    glr_runtime.current_allocator = &glr_runtime.cached_default_allocator;
   }
 
-  return glr_coro_runtime.current_allocator;
+  return glr_runtime.current_allocator;
 }
 
 void *glr_malloc(size_t size, size_t alignment) {
@@ -497,14 +513,17 @@ void glr_exec_context_cleanup(glr_exec_context_t *ctx, stack_size_t *ss) {
 
 void glr_cur_thread_runtime_cleanup() {
   stack_size_t ss = get_stack_size();
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
 
-  if (r->epoll_inited) {
+  if (r->event_loop_inited) {
     //glr_exec_context_cleanup(r->event_loop_ctx, &ss);
     close(r->epoll_fd);
+    close(r->async_eventfd_poll.fd);
   }
+
   free(r->timers);
   free(r->timers_deadlines);
+  free(r->async_jobs_ringbuffer);
 
   for (uint32_t i = 0; i < r->scheduler_currently_in_queue; ++i) {
     uint32_t idx = (r->scheduler_read_idx + i) % r->scheduler_q_cap;
@@ -518,15 +537,15 @@ void glr_cur_thread_runtime_cleanup() {
     glr_exec_context_cleanup(ctx, &ss);
   }
   free(r->free_contexts);
-  *r = (glr_coro_runtime_t) {};
+  *r = (glr_runtime_t) {};
 }
 
 
 glr_exec_context_t *glr_current_context() {
-  if (!glr_coro_runtime.cur_context) {
-    return &glr_coro_runtime.thread_context;
+  if (!glr_runtime.cur_context) {
+    return &glr_runtime.thread_context;
   }
-  return glr_coro_runtime.cur_context;
+  return glr_runtime.cur_context;
 }
 
 void glr_preallocate_contexts(size_t count) {
@@ -554,19 +573,20 @@ void glr_preallocate_contexts(size_t count) {
 }
 
 glr_exec_context_t *glr_get_context_from_freelist() {
-  if (!glr_coro_runtime.free_contexts_len) {
+  if (!glr_runtime.free_contexts_len) {
     glr_preallocate_contexts(1);
   }
-  glr_exec_context_t *result = glr_coro_runtime.free_contexts[0];
-  glr_coro_runtime.free_contexts[0]
-      = glr_coro_runtime.free_contexts[glr_coro_runtime.free_contexts_len - 1];
-  glr_coro_runtime.free_contexts_len--;
+  glr_exec_context_t *result = glr_runtime.free_contexts[0];
+  glr_runtime.free_contexts[0] =
+      glr_runtime.free_contexts[glr_runtime.free_contexts_len - 1];
+  glr_runtime.free_contexts_len--;
+  result->saved_allocator = NULL;
   return result;
 }
 
 
 void glr_put_context_to_freelist(glr_exec_context_t *context) {
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
   if (r->free_contexts_len + 1 > r->free_contexts_cap) {
     uint32_t new_cap = r->free_contexts_cap * 2;
     if (!new_cap) {
@@ -632,7 +652,9 @@ asm("\t.text\n"
 );
 
 void glr_transfer(glr_exec_context_t *prev, glr_exec_context_t *next) {
-  glr_coro_runtime.cur_context = next;
+  prev->saved_allocator = glr_runtime.current_allocator;
+  glr_runtime.current_allocator = next->saved_allocator;
+  glr_runtime.cur_context = next;
   glr_coro_transfer(prev, next);
 }
 
@@ -641,7 +663,7 @@ void glr_transfer_to(glr_exec_context_t *next) {
 }
 
 void glr_coro_init(void) {
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
   glr_coro_func_t func = r->new_coro_func;
   void *arg = r->new_coro_arg;
 
@@ -655,7 +677,7 @@ void glr_coro_init(void) {
   asm(".cfi_undefined rip");
 #endif
 
-  func((void *)arg);
+  func(arg);
 
   glr_put_context_to_freelist(own_context);
   glr_scheduler_yield(0);
@@ -665,7 +687,7 @@ void glr_coro_init(void) {
 }
 
 void glr_create_coro(glr_exec_context_t *ctx, glr_coro_func_t fn, void *arg) {
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
   r->new_coro_func = fn;
   r->new_coro_arg = arg;
 
@@ -690,7 +712,7 @@ glr_exec_context_t *glr_go(glr_coro_func_t fn, void *arg) {
 }
 
 void glr_scheduler_add(glr_exec_context_t *ctx) {
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
   if (r->scheduler_currently_in_queue + 1 > r->scheduler_q_cap) {
     uint32_t new_cap = r->scheduler_q_cap * 4;
     if (!new_cap) {
@@ -714,7 +736,7 @@ void glr_scheduler_add(glr_exec_context_t *ctx) {
 }
 
 void glr_scheduler_yield(int reschedule_current_ctx) {
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
   glr_exec_context_t *cur_ctx = glr_current_context();
   if (reschedule_current_ctx) {
     glr_scheduler_add(cur_ctx);
@@ -740,24 +762,20 @@ inline void err_cleanup(err_t *err) {
 // networking
 int64_t glr_timestamp_in_ms() {
   struct timeval t;
-  int rc = gettimeofday(&t, NULL);
-  if (rc != 0) {
-    int errno_copy = errno;
-    (void) errno_copy;
-    abort();//TODO: logging should be here
-  }
+  //TODO replace with clock_gettime()
+  gettimeofday(&t, NULL);
   return t.tv_sec * 1000 + t.tv_usec / 1000;
 }
 
 
 static void glr_event_loop() {
   printf("event_loop started\n");
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
   const size_t max_events = 64;
   struct epoll_event revents[max_events];
   for (;;) {
     int timeout = 0;
-    if (glr_coro_runtime.scheduler_currently_in_queue == 0) {
+    if (glr_runtime.scheduler_currently_in_queue == 0) {
       timeout = -1;
     }
 
@@ -784,7 +802,6 @@ static void glr_event_loop() {
         glr_timer_t *t = r->timers[i];
         glr_remove_timer(t);
         t->callback(t);
-        printf("timer fired\n");
       } else {
         ++i;
       }
@@ -796,7 +813,6 @@ static void glr_event_loop() {
       poll->last_epoll_event_bitset = event->events;
       if (poll->cb) {
         poll->cb(poll);
-        printf("poll called\n");
       }
     }
 
@@ -805,23 +821,50 @@ static void glr_event_loop() {
 
 }
 
+static void glr_async_consume(glr_poll_t *p);
+
 static void glr_init_event_loop() {
-  glr_coro_runtime.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-  if (glr_coro_runtime.epoll_fd < 0) {
+  glr_runtime.event_loop_inited = 1;
+
+  glr_runtime.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (glr_runtime.epoll_fd < 0) {
     //Global logger should be used here
     perror("Failed to create epoll instance");
     perror(strerror(errno));
     abort();
   }
-  glr_coro_runtime.event_loop_ctx = glr_go(glr_event_loop, NULL);
-  glr_coro_runtime.epoll_inited = 1;
+  glr_runtime.event_loop_ctx = glr_go(glr_event_loop, NULL);
+
+  glr_runtime.async_jobs_ringbuffer_cap = 65536;
+  //glr_runtime.async_jobs_ringbuffer_cap = 10;
+  size_t ringbuffer_size = sizeof(job_t) * glr_runtime.async_jobs_ringbuffer_cap;
+  glr_runtime.async_jobs_ringbuffer = (atomic_job_t *) malloc(ringbuffer_size);
+  memset(glr_runtime.async_jobs_ringbuffer, 0, ringbuffer_size);
+
+  glr_runtime.async_eventfd_poll.fd = eventfd(0, EFD_NONBLOCK);
+  if (glr_runtime.async_eventfd_poll.fd < 0) {
+    //Global logger should be used here
+    perror("Failed to create eventfd instance async posts");
+    perror(strerror(errno));
+    abort();
+  }
+  glr_runtime.async_eventfd_poll.cb = glr_async_consume;
+
+  err_t err = {};
+  glr_add_poll(&glr_runtime.async_eventfd_poll, EPOLLET|EPOLLIN, &err);
+  if (err.error) {
+    perror("Failed to poll eventfd instance of async tasks: ");
+    str_t s = glr_stringbuilder_build(&err.msg);
+    perror(s.data);
+    abort();
+ }
 }
 
 static inline uint32_t glr_runtime_get_epoll_fd() {
-  if (glr_unlikely(glr_coro_runtime.epoll_inited == 0)) {
+  if (glr_unlikely(glr_runtime.event_loop_inited == 0)) {
     glr_init_event_loop();
   }
-  return glr_coro_runtime.epoll_fd;
+  return glr_runtime.epoll_fd;
 }
 
 void glr_add_poll(glr_poll_t *poll, int flags, err_t *err) {
@@ -929,8 +972,8 @@ int glr_wait_for(int fd, uint32_t flags, err_t *err) {
 }
 
 void glr_add_timer(glr_timer_t *t) {
-  glr_coro_runtime_t *r = &glr_coro_runtime;
-  if (!r->epoll_inited) {
+  glr_runtime_t *r = &glr_runtime;
+  if (!r->event_loop_inited) {
     glr_init_event_loop();
   }
 
@@ -963,7 +1006,7 @@ void glr_add_timer(glr_timer_t *t) {
 }
 
 void glr_remove_timer(glr_timer_t *t) {
-  glr_coro_runtime_t *r = &glr_coro_runtime;
+  glr_runtime_t *r = &glr_runtime;
   uint32_t idx = t->internal_idx;
 
   if (idx >= r->timers_len) {
@@ -986,3 +1029,66 @@ void glr_remove_timer(glr_timer_t *t) {
   t->internal_idx = -1;
 }
 
+glr_runtime_t *glr_cur_thread_runtime() {
+  if (!glr_runtime.event_loop_inited) {
+    glr_init_event_loop();
+  }
+  return &glr_runtime;
+}
+
+void glr_async_post(glr_runtime_t *r, glr_job_fn_t fn, void *arg) {
+  if (!fn) {
+    abort();
+  }
+
+  job_t j = {fn, arg};
+  uint32_t tmp_w_idx = r->async_jobs_w_idx;
+  uint32_t new_w_idx = 0;
+  do {
+    new_w_idx = (tmp_w_idx + 1) % r->async_jobs_ringbuffer_cap;
+  } while (!atomic_compare_exchange_weak(&r->async_jobs_w_idx, &tmp_w_idx, new_w_idx));
+
+  job_t cur = r->async_jobs_ringbuffer[tmp_w_idx];
+  while (cur.fn) {
+    sched_yield();
+    cur = r->async_jobs_ringbuffer[tmp_w_idx];
+  }
+
+  r->async_jobs_ringbuffer[tmp_w_idx] = j;
+  if (!r->async_woken_up) {
+    r->async_woken_up = 1;
+    uint64_t c = 1;
+    int n = write(r->async_eventfd_poll.fd, &c, sizeof(c));
+    if (n != sizeof(c)) {
+      //TODO: proper logging should be here
+    }
+  }
+}
+
+static void glr_async_consume(glr_poll_t *p) {
+  (void)p;
+  glr_runtime_t *r = &glr_runtime;
+
+  uint64_t c;
+  read(r->async_eventfd_poll.fd, &c, sizeof(c));
+  r->async_woken_up = 0;
+
+  const uint32_t cap = r->async_jobs_ringbuffer_cap;
+  atomic_job_t *rb = r->async_jobs_ringbuffer;
+  uint32_t r_idx = r->async_jobs_r_idx;
+  const uint32_t w_idx = r->async_jobs_w_idx;
+
+  job_t j = rb[r_idx];
+  if (r_idx == w_idx && !j.fn) {
+    return;
+  }
+
+  do {
+    while (!j.fn) j = rb[r_idx];
+
+    j.fn(j.arg);
+    rb[r_idx] = (job_t){};
+    r->async_jobs_r_idx = r_idx = (r_idx + 1) % cap;
+    j = rb[r_idx];
+  } while (r_idx != w_idx);
+}
