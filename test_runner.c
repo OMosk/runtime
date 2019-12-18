@@ -9,6 +9,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -899,7 +900,62 @@ static void test_async5(int n) {
 
 }
 
+static void test_sleep() {
+  TEST;
+
+  glr_sleep(1);
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_address_resolving(const char *addr) {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+
+  err_t e = {};
+  struct sockaddr_storage packed_address = glr_resolve_address2(addr, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s glr_resolve_address2 failed: %.*s",
+           __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  str_t ip_port_str = glr_addr_to_string(&packed_address);
+  printf("%s resolved to %.*s\n", addr, ip_port_str.len, ip_port_str.data);
+
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_address_not_resolving(const char *addr) {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+
+  err_t e = {};
+  struct sockaddr_storage packed_address = glr_resolve_address2(addr, &e);
+  switch ((resolve_addr_err_t)e.error) {
+  case RESOLVE_ADDR_ERROR_NONE:
+  case RESOLVE_ADDR_ERROR_GETADDRINFO_FAILED:
+  case RESOLVE_ADDR_ERROR_FAILED_TO_PARSE_ADDR_STR: {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s glr_resolve_address2 failed: '%s' was resolved unexpectedly (%.*s)",
+           __FILE__, __LINE__, __func__, addr, msg.len, msg.data);
+    abort();
+  } break;
+  case RESOLVE_ADDR_ERROR_NO_RESULT: {
+  } break;
+  }
+  (void) packed_address;
+
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
 int main() {
+  int async_tests_enabled = 0;
   label_pointers();
   error_handling();
   test_global_malloc_free_adapter();
@@ -925,19 +981,29 @@ int main() {
   bench_transient_allocation();
   test_timers();
   test_allocator_preserving_between_coros();
-  test_async1();
-  for (int i = 0; i < 100; ++i) {
-    test_async2(10000);
-  }
-  for (int i = 0; i < 100; ++i) {
-    test_async2(100000);
-  }
-  for (int i = 0; i < 10; ++i) {
-    test_async3(10000);
-  }
-  test_async4();
-  for (int i = 0; i < 100; ++i) {
-    test_async5(100000);
+
+  if (async_tests_enabled) {
+    test_async1();
+    for (int i = 0; i < 100; ++i) {
+      test_async2(10000);
+    }
+    for (int i = 0; i < 100; ++i) {
+      test_async2(100000);
+    }
+    for (int i = 0; i < 10; ++i) {
+      test_async3(10000);
+    }
+    test_async4();
+    for (int i = 0; i < 100; ++i) {
+      test_async5(100000);
+    }
   }
 
+  test_sleep();
+
+  test_address_resolving("www.google.com:443");
+  test_address_resolving("youtube.com:443");
+  test_address_resolving("facebook.com:443");
+  test_address_not_resolving("my.abra.cadabra:443");
+  test_address_not_resolving("othe.rser.vice:1024");
 }

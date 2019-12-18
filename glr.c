@@ -9,6 +9,9 @@
 #include <sys/epoll.h>
 #include <sys/time.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <errno.h>
@@ -318,6 +321,15 @@ str_t glr_sprintf(glr_allocator_t *a, const char *format, ...) {
 
   va_end(args);
 
+  return result;
+}
+
+str_t glr_strdup(str_t s) {
+  str_t result;
+  result.cap = s.cap;
+  result.len = s.len;
+  result.data = GLR_ALLOCATE_ARRAY(char, s.len);
+  memcpy(result.data, s.data, s.len);
   return result;
 }
 
@@ -879,7 +891,7 @@ void glr_add_poll(glr_poll_t *poll, int flags, err_t *err) {
   ev.events = flags;
   int rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, poll->fd, &ev);
   if (rc == -1) {
-    err->error = ERROR_FAILED_EPOLL_CTL;
+    err->error = POLL_ERROR_FAILED_EPOLL_CTL;
     char buffer[256];
     strerror_r(errno, buffer, 256);
     glr_stringbuilder_printf(
@@ -900,7 +912,7 @@ void glr_change_poll(glr_poll_t *poll, int flags, err_t *err) {
   ev.events = flags;
   int rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, poll->fd, &ev);
   if (rc == -1) {
-    err->error = ERROR_FAILED_EPOLL_CTL;
+    err->error = POLL_ERROR_FAILED_EPOLL_CTL;
     char buffer[256];
     strerror_r(errno, buffer, 256);
     glr_stringbuilder_printf(
@@ -919,7 +931,7 @@ void glr_remove_poll(glr_poll_t *poll, err_t *err) {
   struct epoll_event ev = {};
   int rc = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, poll->fd, &ev);
   if (rc == -1) {
-    err->error = ERROR_FAILED_EPOLL_CTL;
+    err->error = POLL_ERROR_FAILED_EPOLL_CTL;
     char buffer[256];
     strerror_r(errno, buffer, 256);
     glr_stringbuilder_printf(
@@ -938,7 +950,7 @@ int glr_wait_for(int fd, uint32_t flags, err_t *err) {
   }
 
   if (flags == 0) {
-    err->error = ERROR_INVALID_ARG;
+    err->error = POLL_ERROR_INVALID_ARG;
     glr_stringbuilder_printf(
         &err->msg, "%s:%d glr_wait_for flags should not be 0",
         __FILE__, __LINE__);
@@ -1029,6 +1041,20 @@ void glr_remove_timer(glr_timer_t *t) {
   t->internal_idx = -1;
 }
 
+static void glr_wakeup_on_timer(glr_timer_t *t) {
+  glr_exec_context_t *ctx = t->arg;
+  glr_scheduler_add(ctx);
+}
+
+void glr_sleep(int msec) {
+  glr_timer_t t = {};
+  t.deadline_posix_milliseconds = glr_timestamp_in_ms() + msec;
+  t.arg = glr_current_context();
+  t.callback = glr_wakeup_on_timer;
+  glr_add_timer(&t);
+  glr_scheduler_yield(0);
+}
+
 glr_runtime_t *glr_cur_thread_runtime() {
   if (!glr_runtime.event_loop_inited) {
     glr_init_event_loop();
@@ -1091,4 +1117,107 @@ static void glr_async_consume(glr_poll_t *p) {
     r->async_jobs_r_idx = r_idx = (r_idx + 1) % cap;
     j = rb[r_idx];
   } while (r_idx != w_idx);
+}
+
+struct sockaddr_storage glr_resolve_address(const char *host, const char *port,
+                                            err_t *err) {
+  if (err->error) return (struct sockaddr_storage){};
+
+  struct sockaddr_storage addr = {};
+
+  struct addrinfo *result = NULL;
+  int rc = getaddrinfo(host, port, NULL, &result);
+  if (rc != 0 && rc != EAI_NONAME) {
+    err->error = RESOLVE_ADDR_ERROR_GETADDRINFO_FAILED;
+    err->sub_error = rc;
+    glr_stringbuilder_printf(
+        &err->msg, "%s:%d:%s getaddrinfo(%s, %s) failed rc=%d, err=%s\n",
+        __FILE__, __LINE__, __func__, host, port, rc, gai_strerror(rc));
+    goto cleanup;
+  }
+
+  if (!result || rc == EAI_NONAME) {
+    err->error = RESOLVE_ADDR_ERROR_NO_RESULT;
+    err->sub_error = 0;
+    glr_stringbuilder_printf(
+        &err->msg, "%s:%d:%s getaddrinfo(%s, %s) returned no result\n",
+        __FILE__, __LINE__, __func__, host, port);
+
+    goto cleanup;
+  }
+
+  memcpy(&addr, result->ai_addr, result->ai_addrlen);
+cleanup:
+  freeaddrinfo(result);
+  return addr;
+}
+
+struct sockaddr_storage glr_resolve_address1(const char *host, int port,
+                                             err_t *err) {
+  char port_buffer[10];
+  snprintf(port_buffer, 10, "%d", port);
+  return glr_resolve_address(host, port_buffer, err);
+}
+
+
+struct sockaddr_storage glr_resolve_address2(const char *addr, err_t *err) {
+  if (err->error) return (struct sockaddr_storage){};
+
+  const char *host_begin = addr;
+  const char *last_colon = NULL;
+  const char *it = addr;
+
+  while (*it) {
+    if (*it == ':') {
+      last_colon = it;
+    }
+    ++it;
+  }
+
+  if (last_colon == NULL) {
+    err->error = RESOLVE_ADDR_ERROR_FAILED_TO_PARSE_ADDR_STR;
+    err->sub_error = 0;
+    glr_stringbuilder_printf(
+        &err->msg, "%s:%d:%s failed to split \"%s\" to host and port\n",
+        __FILE__, __LINE__, __func__, addr);
+
+    return (struct sockaddr_storage){};
+  }
+
+  const char *port_end = it;
+  const char *port_begin = last_colon + 1;
+  const char *host_end = last_colon;
+
+  char host[host_end - host_begin + 1];
+  char port[port_end - port_begin + 1];
+  strncpy(host, host_begin, host_end - host_begin);
+  host[host_end - host_begin] = 0;
+  strncpy(port, port_begin, port_end - port_begin);
+  port[port_end - port_begin] = 0;
+  return glr_resolve_address(host, port, err);
+}
+
+str_t glr_addr_to_string(const struct sockaddr_storage *addr) {
+  switch (addr->ss_family) {
+  case AF_INET:
+  case AF_INET6: {
+    char buffer[INET6_ADDRSTRLEN + 1];
+    inet_ntop(addr->ss_family, &((struct sockaddr_in *)addr)->sin_addr, buffer,
+              sizeof(buffer));
+    stringbuilder_t sb = glr_make_stringbuilder(256);
+    glr_stringbuilder_append(&sb, buffer, strlen(buffer));
+    uint32_t port = 0;
+    if (addr->ss_family == AF_INET) {
+      port = ntohs(((struct sockaddr_in *)addr)->sin_port);
+    } else {
+      port = ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+    }
+    glr_stringbuilder_printf(&sb, ":%u", port);
+    str_t result = glr_stringbuilder_build(&sb);
+    glr_stringbuilder_free_buffers(&sb);
+    return result;
+  };
+  default:
+    return GLR_STRDUP_LITERAL("Unsupported family");
+  }
 }

@@ -42,6 +42,11 @@ typedef struct {
 str_t glr_sprintf(glr_allocator_t *a, const char *format, ...)
   __attribute__((format(printf, 2, 3)));
 
+str_t glr_strdup(str_t s);
+
+#define GLR_STRDUP_LITERAL(s) \
+  (glr_strdup((str_t){s, sizeof(s) - 1, sizeof(s) - 1}))
+
 void glr_push_allocator(glr_allocator_t *a);
 glr_allocator_t* glr_pop_allocator(void);
 glr_allocator_t* glr_current_allocator(void);
@@ -102,6 +107,7 @@ enum {
 
 typedef struct {
   int error;
+  int sub_error;
   stringbuilder_t msg;
 } err_t;
 
@@ -117,10 +123,12 @@ typedef struct glr_poll_t {
   void *cb_arg;
 } glr_poll_t;
 
-enum {
-  ERROR_FAILED_EPOLL_CTL=1,
-  ERROR_INVALID_ARG=2,
-};
+typedef enum poll_error_t {
+  POLL_ERROR_NONE,
+  POLL_ERROR_FAILED_EPOLL_CTL,
+  POLL_ERROR_INVALID_ARG,
+} poll_error_t;
+
 void glr_add_poll(glr_poll_t *poll, int flags, err_t *err);
 void glr_change_poll(glr_poll_t *poll, int flags, err_t *err);
 void glr_remove_poll(glr_poll_t *poll, err_t *err);
@@ -135,6 +143,7 @@ typedef struct glr_timer_t {
 
 void glr_add_timer(glr_timer_t *timer);
 void glr_remove_timer(glr_timer_t *timer);
+void glr_sleep(int msec);
 
 typedef void (*glr_job_fn_t)(void *);
 typedef struct glr_runtime_t glr_runtime_t;
@@ -144,6 +153,22 @@ glr_runtime_t *glr_cur_thread_runtime();
 void glr_async_post(glr_runtime_t *r, glr_job_fn_t fn, void *arg);
 
 void glr_run_in_thread_pool(glr_job_fn_t fn, void *arg);
+
+typedef enum resolve_addr_err_t {
+  RESOLVE_ADDR_ERROR_NONE,
+  RESOLVE_ADDR_ERROR_GETADDRINFO_FAILED,
+  RESOLVE_ADDR_ERROR_NO_RESULT,
+  RESOLVE_ADDR_ERROR_FAILED_TO_PARSE_ADDR_STR,
+} resolve_addr_err_t;
+
+struct sockaddr_storage glr_resolve_address(const char *host, const char *port, err_t *err);
+struct sockaddr_storage glr_resolve_address1(const char *host, int port, err_t *err);
+struct sockaddr_storage glr_resolve_address2(const char *addr, err_t *err);
+
+str_t glr_addr_to_string(const struct sockaddr_storage *addr);
+
+struct glr_fd;
+typedef struct glr_fd glr_fd;
 
 
 #endif //GLR_H
