@@ -9,9 +9,14 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/types.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <pthread.h>
 #include <stdatomic.h>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "glr.h"
 
@@ -179,8 +184,8 @@ static void test_glr_sprintf() {
 
   printf("%s:%d:%s Float=%.6f'\n", __FILE__, __LINE__, __func__, 123.45);
 
-  str_t string = glr_sprintf(&a, "%s:%d:%s Float=%.6fEnd",
-                             __FILE__, __LINE__, __func__, 123.45);
+  str_t string = glr_sprintf_ex(&a, "%s:%d:%s Float=%.6fEnd",
+                               __FILE__, __LINE__, __func__, 123.45);
 
   fwrite(string.data, 1, string.len, stdout);
   printf("\n");
@@ -239,6 +244,9 @@ static void test_stringbuilder() {
 
   str_t result = glr_stringbuilder_build(&sb);
   printf("%s\n", result.data);
+  if (strcmp(result.data, "Hello world 123, End") != 0) {
+    abort();
+  }
 
   glr_pop_allocator();
   glr_destroy_allocator(&a1);
@@ -514,7 +522,7 @@ static void test_poll() {
 
   close(fd);
   glr_cur_thread_runtime_cleanup();
-  err_cleanup(&err);
+  glr_err_cleanup(&err);
 }
 
 static void test_error_handling() {
@@ -531,7 +539,7 @@ static void test_error_handling() {
   }
 
   glr_cur_thread_runtime_cleanup();
-  err_cleanup(&err);
+  glr_err_cleanup(&err);
 }
 
 static void test_transient_allocator_embedding() {
@@ -936,17 +944,12 @@ static void test_address_not_resolving(const char *addr) {
 
   err_t e = {};
   struct sockaddr_storage packed_address = glr_resolve_address2(addr, &e);
-  switch ((resolve_addr_err_t)e.error) {
-  case RESOLVE_ADDR_ERROR_NONE:
-  case RESOLVE_ADDR_ERROR_GETADDRINFO_FAILED:
-  case RESOLVE_ADDR_ERROR_FAILED_TO_PARSE_ADDR_STR: {
+  if (e.error == GLR_GETADDRINFO_NO_RESULT_ERROR) {
+  } else {
     str_t msg = glr_stringbuilder_build(&e.msg);
     printf("%s:%d:%s glr_resolve_address2 failed: '%s' was resolved unexpectedly (%.*s)",
            __FILE__, __LINE__, __func__, addr, msg.len, msg.data);
     abort();
-  } break;
-  case RESOLVE_ADDR_ERROR_NO_RESULT: {
-  } break;
   }
   (void) packed_address;
 
@@ -954,8 +957,606 @@ static void test_address_not_resolving(const char *addr) {
   glr_cur_thread_runtime_cleanup();
 }
 
+static void test_tcp_listening(const char *requested_addr) {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address
+      = glr_resolve_address2(requested_addr, &e);
+
+  glr_fd_t *listener = glr_listen(&packed_address, 1000, 1, &e);
+
+  (void) listener;
+  struct sockaddr_storage res = glr_socket_local_address(listener, &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  str_t addr = glr_addr_to_string(&res);
+  printf("%s:%d:%s listening on %.*s (expected %s)\n",
+         __FILE__, __LINE__, __func__, addr.len, addr.data, requested_addr);
+
+  glr_close(listener);
+
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_unix_listening(const char *requested_addr) {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address
+      = glr_resolve_unix_socket_addr(requested_addr);
+
+  unlink(requested_addr);
+  glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
+
+  (void) listener;
+  struct sockaddr_storage res = glr_socket_local_address(listener, &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  str_t addr = glr_addr_to_string(&res);
+  printf("%s:%d:%s listening on %.*s (expected %s)\n",
+         __FILE__, __LINE__, __func__, addr.len, addr.data, requested_addr);
+
+  glr_close(listener);
+
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_fd_freelist_reuse(const char *unix_socket_addr) {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address
+      = glr_resolve_unix_socket_addr(unix_socket_addr);
+  for (int i = 0; i < 5; ++i) {
+    unlink(unix_socket_addr);
+    glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
+
+    (void) listener;
+    struct sockaddr_storage res = glr_socket_local_address(listener, &e);
+
+    if (e.error) {
+      str_t msg = glr_stringbuilder_build(&e.msg);
+      printf("%s:%d:%s %.*s\n",
+          __FILE__, __LINE__, __func__, msg.len, msg.data);
+      abort();
+    }
+
+    str_t addr = glr_addr_to_string(&res);
+    printf("%s:%d:%s listening on %.*s (expected %s)\n",
+           __FILE__, __LINE__, __func__, addr.len, addr.data, unix_socket_addr);
+
+    glr_close(listener);
+  }
+
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+void *test_accept_thread_fn(void *arg) {
+  const char *requested_addr = arg;
+  struct sockaddr_un addr;
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, requested_addr, sizeof(addr.sun_path));
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    abort();
+  }
+  int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+  if (rc) {
+    abort();
+  }
+  close(fd);
+  return NULL;
+}
+
+static void test_accept(const char *requested_addr) {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address
+      = glr_resolve_unix_socket_addr(requested_addr);
+
+  unlink(requested_addr);
+  glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
+
+  (void) listener;
+  struct sockaddr_storage res = glr_socket_local_address(listener, &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  str_t addr = glr_addr_to_string(&res);
+  printf("%s:%d:%s listening on %.*s (expected %s)\n",
+         __FILE__, __LINE__, __func__, addr.len, addr.data, requested_addr);
+
+  pthread_t connect_thread;
+  if (pthread_create(&connect_thread, NULL, test_accept_thread_fn,
+                     (void *)requested_addr)) {
+    abort();
+  }
+
+  glr_accept_result_t accept_result
+      = glr_raw_accept(listener, &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s accept failed: %.*s\n",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  addr = glr_addr_to_string(&accept_result.address);
+  printf("%s:%d:%s accepted connection from %.*s\n",
+         __FILE__, __LINE__, __func__, addr.len, addr.data);
+  pthread_join(connect_thread, NULL);
+
+  glr_close(accept_result.con);
+
+  glr_close(listener);
+
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+typedef struct {
+  struct sockaddr_storage *addr;
+} test_send_recv_data_t;
+
+static void test_send_recv_coro_fn(void *arg) {
+  test_send_recv_data_t *td = arg;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+
+  err_t e = {};
+  glr_fd_t *conn = glr_raw_connect(td->addr, glr_timestamp_in_ms() + 1000, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n", __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  const char data[] = "Hello world";
+  int n = glr_fd_raw_send(conn, data, sizeof(data) - 1, &e);
+  printf("%s:%d:%s Written %d bytes\n", __FILE__, __LINE__, __func__, n);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n", __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  glr_close(conn);
+  glr_destroy_allocator(&a);
+}
+
+static void test_send_recv() {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address =
+      glr_resolve_address2("127.0.0.1:0", &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d %.*s\n", __FILE__, __LINE__, msg.len, msg.data);
+    abort();
+  }
+
+  glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
+
+  packed_address = glr_socket_local_address(listener, &e);
+
+  test_send_recv_data_t td = {&packed_address};
+  glr_go(test_send_recv_coro_fn, &td);
+
+  glr_fd_t *conn = glr_raw_accept(listener, &e).con;
+  char input_buffer[256];
+  int n = glr_fd_raw_recv(conn, input_buffer, 255, &e);
+  printf("%s:%d:%s Received %d bytes, '%.*s'\n", __FILE__, __LINE__, __func__,
+         n, n, input_buffer);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d %.*s\n", __FILE__, __LINE__, msg.len, msg.data);
+    abort();
+  }
+
+  glr_close(conn);
+  glr_close(listener);
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_connect_timeout() {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address =
+      glr_resolve_address2("www.google.com:444", &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d %.*s\n", __FILE__, __LINE__, msg.len, msg.data);
+    abort();
+  }
+
+  glr_fd_t *conn = glr_raw_connect(&packed_address, glr_timestamp_in_ms() + 100, &e);
+  if (e.error != GLR_TIMEOUT_ERROR) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n", __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  (void) conn;
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_recv_timeout() {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address =
+      glr_resolve_address2("127.0.0.1:0", &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d %.*s\n", __FILE__, __LINE__, msg.len, msg.data);
+    abort();
+  }
+
+  glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
+
+  packed_address = glr_socket_local_address(listener, &e);
+
+  glr_fd_t *conn = glr_raw_connect(&packed_address, 0, &e);
+  glr_fd_set_deadline(conn, glr_timestamp_in_ms() + 50);
+  char input_buffer[256] = {0};
+  if (e.error) {
+    abort();
+  }
+  int n = glr_fd_raw_recv(conn, input_buffer, 255, &e);
+  if (e.error != GLR_TIMEOUT_ERROR) {
+    abort();
+  }
+
+  printf("%s:%d:%s Received %d bytes, '%.*s'\n", __FILE__, __LINE__, __func__,
+         n, n, input_buffer);
+
+  glr_close(conn);
+  glr_close(listener);
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_send_timeout() {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address =
+      glr_resolve_address2("127.0.0.1:0", &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d %.*s\n", __FILE__, __LINE__, msg.len, msg.data);
+    abort();
+  }
+
+  glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
+
+  packed_address = glr_socket_local_address(listener, &e);
+
+  glr_fd_t *conn = glr_raw_connect(&packed_address, 0, &e);
+
+  size_t output_buffer_len = 10 * 1024 * 1024;
+  char *output_buffer = GLR_ALLOCATE_ARRAY(char, output_buffer_len);
+  memset(output_buffer, 0, output_buffer_len);
+  if (e.error) {
+    abort();
+  }
+
+  while (e.error != GLR_TIMEOUT_ERROR) {
+    glr_fd_set_deadline(conn, glr_timestamp_in_ms() + 50);
+    int n = glr_fd_raw_send(conn, output_buffer, output_buffer_len, &e);
+    printf("%s:%d:%s Sent %d of %ld bytes\n", __FILE__, __LINE__, __func__, n,
+           output_buffer_len);
+    if (e.error && e.error != GLR_TIMEOUT_ERROR) {
+      abort();
+    }
+  }
+
+  glr_close(conn);
+  glr_close(listener);
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_ssl_connect(const char *domain, const char *port) {
+  printf("%s:%d:%s ssl connect %s:%s\n",
+         __FILE__, __LINE__, __func__, domain, port);
+
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+
+  struct sockaddr_storage packed_address =
+      glr_resolve_address(domain, port, &e);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d %.*s\n", __FILE__, __LINE__, msg.len, msg.data);
+    abort();
+  }
+  SSL_CTX *ctx = glr_ssl_client_context();
+
+  glr_ssl_ctx_set_verify_peer(ctx, 1);
+
+  glr_fd_t *conn = glr_raw_connect(&packed_address, 0, &e);
+  glr_ssl_client_conn_handshake(ctx, conn, domain, 0, &e);
+
+  glr_ssl_shutdown(conn);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d %.*s\n", __FILE__, __LINE__, msg.len, msg.data);
+    abort();
+  }
+
+  SSL_CTX_free(ctx);
+  glr_close(conn);
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+typedef struct {
+  str_t hostname;
+  str_t port;
+} ssl_accept_test_data_t;
+
+void *ssl_accept_test_connection_thread(void *arg) {
+  ssl_accept_test_data_t *td = arg;
+  SSL_CTX *ctx = glr_ssl_client_context();
+  //SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+  BIO *bio = BIO_new_ssl_connect(ctx);
+  if (!bio) abort();
+
+  SSL *ssl = NULL;
+  BIO_get_ssl(bio, &ssl);
+
+  int rc = 0;
+  printf("%s:%d:%s connecting to %.*s:%.*s  \n",
+         __FILE__, __LINE__, __func__,
+         td->hostname.len, td->hostname.data,
+         td->port.len, td->port.data
+         );
+
+  rc = BIO_set_conn_hostname(bio, td->hostname.data);
+  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+
+  rc = BIO_set_conn_port(bio, td->port.data);
+  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+
+  rc = SSL_set_tlsext_host_name(ssl, "test.localhost");
+  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+
+  rc = BIO_do_connect(bio);
+  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+
+  rc = BIO_do_handshake(bio);
+  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+
+  rc = BIO_puts(bio, "Hello");
+  if (rc <= 0) { ERR_print_errors_fp(stderr); abort(); }
+
+  char buffer[256];
+  int len = BIO_read(bio, buffer, 256);
+  printf("%s:%d:%s BIO_read returned %d \n",
+         __FILE__, __LINE__, __func__, len);
+
+  BIO_free_all(bio);
+
+  SSL_CTX_free(ctx);
+  return NULL;
+}
+
+static void test_ssl_accept() {
+  TEST;
+  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&a);
+  err_t e = {};
+  SSL_CTX *ctx = glr_ssl_server_context();
+  glr_ssl_ctx_set_key(ctx, "./certs/key.pem", /*password*/NULL, &e);
+  glr_ssl_ctx_set_cert(ctx, "./certs/cert.pem", &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  struct sockaddr_storage packed_address
+      = glr_resolve_address2("0.0.0.0:0", &e);
+
+  glr_fd_t *listener = glr_listen(&packed_address, 1000, 1, &e);
+
+  struct sockaddr_storage res = glr_socket_local_address(listener, &e);
+
+  str_t addr = glr_addr_to_string(&res);
+  printf("%s:%d:%s listening on %.*s\n",
+         __FILE__, __LINE__, __func__, addr.len, addr.data);
+
+  ssl_accept_test_data_t td = {
+    GLR_STR_LITERAL("127.0.0.1"),
+    glr_sprintf("%d", glr_addr_get_port(&res)),
+  };
+  pthread_t client_thread;
+  if (pthread_create(&client_thread, NULL, ssl_accept_test_connection_thread,
+                     (void *)&td)) {
+    abort();
+  }
+
+  glr_accept_result_t accept_result = glr_raw_accept(listener, &e);
+  glr_ssl_server_conn_upgrade(ctx, accept_result.con, 0, &e);
+  glr_ssl_shutdown(accept_result.con);
+  pthread_join(client_thread, NULL);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  glr_close(accept_result.con);
+  glr_close(listener);
+  SSL_CTX_free(ctx);
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_convenient_connect() {
+  TEST;
+  glr_fd_t *conn = NULL;
+  err_t e = {};
+
+  conn = glr_tcp_dial_addr("google.com:80", 0, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  glr_close(conn);
+
+  conn = glr_tcp_dial_addr_ssl("google.com:443", 0, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  glr_close(conn);
+
+  conn = glr_tcp_dial_hostname_port("google.com", "80", 0, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  glr_close(conn);
+
+  conn = glr_tcp_dial_hostname_port_ssl("google.com", "443", 0, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  glr_close(conn);
+
+  conn = glr_tcp_dial_hostname_port2("google.com", 80, 0, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  glr_close(conn);
+
+  conn = glr_tcp_dial_hostname_port_ssl2("google.com", 443, 0, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+  glr_close(conn);
+
+  glr_cur_thread_runtime_cleanup();
+}
+
+static void test_fd_conn_functions() {
+  TEST;
+  str_t payload = GLR_STR_LITERAL(
+      "GET / HTTP/1.1\r\nHost: google.com\r\nConnection: close\r\n\r\n");
+
+  char recv_buffer[256] = {};
+  int received = 0;
+  glr_fd_t *conn = NULL;
+  err_t e = {};
+
+  conn = glr_tcp_dial_addr("google.com:80", 0, &e);
+  glr_fd_conn_send_exactly(conn, payload.data, payload.len, &e);
+  received = glr_fd_conn_recv_exactly(conn, recv_buffer, 20, &e);
+  glr_fd_conn_shutdown(conn, &e);
+  glr_close(conn);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  printf("%s:%d:%s RECEIVED from 80 port %d bytes: %.*s\n",
+      __FILE__, __LINE__, __func__, received, received, recv_buffer);
+
+  conn = glr_tcp_dial_addr_ssl("google.com:443", 0, &e);
+  glr_fd_conn_send_exactly(conn, payload.data, payload.len, &e);
+  received = glr_fd_conn_recv_exactly(conn, recv_buffer, 20, &e);
+  glr_fd_conn_shutdown(conn, &e);
+  glr_close(conn);
+
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  printf("%s:%d:%s RECEIVED from 443 ssl port %d bytes: %.*s\n",
+      __FILE__, __LINE__, __func__, received, received, recv_buffer);
+
+  glr_cur_thread_runtime_cleanup();
+}
+
 int main() {
   int async_tests_enabled = 0;
+  int dns_tests_enabled = 0;
+
   label_pointers();
   error_handling();
   test_global_malloc_free_adapter();
@@ -1001,9 +1602,28 @@ int main() {
 
   test_sleep();
 
-  test_address_resolving("www.google.com:443");
-  test_address_resolving("youtube.com:443");
-  test_address_resolving("facebook.com:443");
-  test_address_not_resolving("my.abra.cadabra:443");
-  test_address_not_resolving("othe.rser.vice:1024");
+  if (dns_tests_enabled) {
+    test_address_resolving("www.google.com:443");
+    test_address_resolving("youtube.com:443");
+    test_address_resolving("facebook.com:443");
+    test_address_not_resolving("my.abra.cadabra:443");
+    test_address_not_resolving("othe.rser.vice:1024");
+  }
+
+  test_tcp_listening("127.0.0.1:12345");
+  test_tcp_listening("0.0.0.0:0");
+
+  test_unix_listening("/tmp/glr.sock");
+  test_fd_freelist_reuse("/tmp/glr.sock");
+
+  test_accept("/tmp/glr.sock");
+  test_send_recv();
+  test_connect_timeout();
+  test_recv_timeout();
+  test_send_timeout();
+
+  test_ssl_connect("httpbin.org", "443");
+  test_ssl_accept();
+  test_convenient_connect();
+  test_fd_conn_functions();
 }

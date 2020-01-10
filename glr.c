@@ -1,4 +1,5 @@
 #include "glr.h"
+
 #include <malloc.h>
 #include <stdint.h>
 #include <string.h>
@@ -9,18 +10,28 @@
 #include <sys/epoll.h>
 #include <sys/time.h>
 #include <sys/eventfd.h>
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <errno.h>
 
-//Features
-#define GLR_VALGRIND
-
 #ifdef GLR_VALGRIND
 #    include <valgrind/valgrind.h>
+#endif
+
+#ifdef GLR_SSL
+#    include <openssl/err.h>
+#    include <openssl/ssl.h>
+#    include <openssl/opensslv.h>
+#    include <openssl/bio.h>
+
+#    if OPENSSL_VERSION_NUMBER < 0x10100000L
+#        error "Too old version of openssl"
+#    endif
 #endif
 
 
@@ -88,6 +99,14 @@ typedef struct glr_runtime_t {
   _Atomic uint32_t async_woken_up;
   glr_poll_t async_eventfd_poll;
 
+  glr_fd_t *fd_freelist;
+
+#ifdef GLR_SSL
+  BIO_METHOD *ssl_bio_method;
+  SSL_CTX *ssl_client_default_ctx;
+#endif
+
+  char strerror_r_buffer[256];
 } glr_runtime_t;
 
 //static thread_local glr_exec_context_t thread_context;
@@ -304,7 +323,7 @@ void glr_free(void *data) {
   return glr_allocator_free(glr_current_allocator(), data);
 }
 
-str_t glr_sprintf(glr_allocator_t *a, const char *format, ...) {
+str_t glr_sprintf_ex(glr_allocator_t *a, const char *format, ...) {
   va_list args;
   va_start(args, format);
 
@@ -405,9 +424,14 @@ void glr_stringbuilder_append(stringbuilder_t *sb, const char *data, size_t len)
   active_block->data[active_block->len] = 0;
 }
 
-void glr_stringbuilder_printf(stringbuilder_t *sb, const char *format, ...) {
+
+void glr_stringbuilder_append2(stringbuilder_t *sb, const str_t s) {
+  glr_stringbuilder_append(sb, s.data, s.len);
+}
+
+void glr_stringbuilder_vprintf(stringbuilder_t *sb, const char *format, va_list va) {
   va_list args;
-  va_start(args, format);
+  va_copy(args, va);
   int needed_cap = vsnprintf(NULL, 0, format, args) + 1;
   va_end(args);
 
@@ -420,14 +444,25 @@ void glr_stringbuilder_printf(stringbuilder_t *sb, const char *format, ...) {
   char *data_ptr = active_block->data + active_block->len;
   int cap_left = active_block->cap - active_block->len;
 
-  va_start(args, format);
+  va_copy(args, va);
   int written = vsnprintf(data_ptr, cap_left, format, args);
   va_end(args);
 
   active_block->len += written;
 }
 
+void glr_stringbuilder_printf(stringbuilder_t *sb, const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  glr_stringbuilder_vprintf(sb, format, args);
+  va_end(args);
+}
+
 str_t glr_stringbuilder_build(stringbuilder_t *sb) {
+  if (sb->len == 0) {
+    return (str_t){};
+  }
+
   if (sb->active_block_idx == 0) {
     //fast path -- giveaway that single buffer that was used
 
@@ -546,9 +581,35 @@ void glr_cur_thread_runtime_cleanup() {
 
   for (uint32_t i = 0; i < r->free_contexts_len; ++i) {
     glr_exec_context_t *ctx = r->free_contexts[i];
+    /*
+     * FIXME: currently it does not work properly and cause tests to segfault
+    glr_allocator_t *allocator_it = ctx->saved_allocator;
+    while (allocator_it) {
+      glr_allocator_t *tmp = allocator_it;
+      allocator_it = allocator_it->next;
+      glr_destroy_allocator(tmp);
+    }
+    */
     glr_exec_context_cleanup(ctx, &ss);
   }
   free(r->free_contexts);
+
+  glr_fd_t *next = r->fd_freelist;
+  while (next) {
+    glr_fd_t *tmp = next;
+    next = *(glr_fd_t **) next;
+    free(tmp);
+  }
+
+#ifdef GLR_SSL
+  if (r->ssl_bio_method) {
+    BIO_meth_free(r->ssl_bio_method);
+  }
+  if (r->ssl_client_default_ctx) {
+    SSL_CTX_free(r->ssl_client_default_ctx);
+  }
+#endif
+
   *r = (glr_runtime_t) {};
 }
 
@@ -766,10 +827,35 @@ void glr_scheduler_yield(int reschedule_current_ctx) {
   glr_transfer(cur_ctx, next_ctx);
 }
 //error handling
-inline void err_cleanup(err_t *err) {
+inline void glr_err_cleanup(err_t *err) {
   glr_stringbuilder_free_buffers(&err->msg);
   *err = (err_t) {};
 }
+
+const char *glr_posix_error = "GLR_POSIX_ERROR";
+
+void glr_make_posix_error(err_t *err, const char *file, int line,
+                          const char *func, const char *format, ...) {
+  int saved_errno = errno;
+  err->error = GLR_POSIX_ERROR;
+  err->sub_error = saved_errno;
+  err->msg = glr_make_stringbuilder(256);
+  const char *error_msg = strerror_r(saved_errno, glr_runtime.strerror_r_buffer,
+             sizeof(glr_runtime.strerror_r_buffer));
+  glr_stringbuilder_printf(&err->msg,
+                           "%s:%d:%s errno=%d '%s' ", file,
+                           line, func, saved_errno, error_msg);
+  va_list va;
+  va_start(va, format);
+  glr_stringbuilder_vprintf(&err->msg, format, va);
+  va_end(va);
+}
+
+const char *glr_invalid_argument_error = "GLR_INVALID_ARGUMENT_ERROR";
+const char *glr_getaddrinfo_error = "GLR_GETADDRINFO_ERROR";
+const char *glr_getaddrinfo_no_result_error = "GLR_GETADDRINFO_NO_RESULT_ERROR";
+const char *glr_general_error = "GLR_GENERAL_ERROR";
+const char *glr_timeout_error = "GLR_TIMEOUT_ERROR";
 
 // networking
 int64_t glr_timestamp_in_ms() {
@@ -891,12 +977,7 @@ void glr_add_poll(glr_poll_t *poll, int flags, err_t *err) {
   ev.events = flags;
   int rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, poll->fd, &ev);
   if (rc == -1) {
-    err->error = POLL_ERROR_FAILED_EPOLL_CTL;
-    char buffer[256];
-    strerror_r(errno, buffer, 256);
-    glr_stringbuilder_printf(
-        &err->msg, "%s:%d epoll_ctl(..., EPOLL_CTL_ADD, ...) because: %s",
-        __FILE__, __LINE__, buffer);
+    GLR_MAKE_POSIX_ERROR(err, "epoll_ctl(..., EPOLL_CTL_ADD, ...) failed");
   }
 }
 
@@ -912,12 +993,7 @@ void glr_change_poll(glr_poll_t *poll, int flags, err_t *err) {
   ev.events = flags;
   int rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, poll->fd, &ev);
   if (rc == -1) {
-    err->error = POLL_ERROR_FAILED_EPOLL_CTL;
-    char buffer[256];
-    strerror_r(errno, buffer, 256);
-    glr_stringbuilder_printf(
-        &err->msg, "%s:%d epoll_ctl(..., EPOLL_CTL_MOD, ...) because: %s",
-        __FILE__, __LINE__, buffer);
+    GLR_MAKE_POSIX_ERROR(err, "epoll_ctl(..., EPOLL_CTL_MOD, ...) failed");
   }
 }
 
@@ -931,12 +1007,7 @@ void glr_remove_poll(glr_poll_t *poll, err_t *err) {
   struct epoll_event ev = {};
   int rc = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, poll->fd, &ev);
   if (rc == -1) {
-    err->error = POLL_ERROR_FAILED_EPOLL_CTL;
-    char buffer[256];
-    strerror_r(errno, buffer, 256);
-    glr_stringbuilder_printf(
-        &err->msg, "%s:%d epoll_ctl(..., EPOLL_CTL_DEL, ...) because: %s",
-        __FILE__, __LINE__, buffer);
+    GLR_MAKE_POSIX_ERROR(err, "epoll_ctl(..., EPOLL_CTL_DEL, ...) failed");
   }
 }
 
@@ -950,13 +1021,14 @@ int glr_wait_for(int fd, uint32_t flags, err_t *err) {
   }
 
   if (flags == 0) {
-    err->error = POLL_ERROR_INVALID_ARG;
+    err->error = GLR_INVALID_ARGUMENT_ERROR;
     glr_stringbuilder_printf(
-        &err->msg, "%s:%d glr_wait_for flags should not be 0",
-        __FILE__, __LINE__);
+        &err->msg, "%s:%d:%s glr_wait_for flags should not be 0",
+        __FILE__, __LINE__, __func__);
 
     return 0;
   }
+
   glr_poll_t p;
   p.fd = fd;
   p.cb_arg = glr_current_context();
@@ -1128,7 +1200,7 @@ struct sockaddr_storage glr_resolve_address(const char *host, const char *port,
   struct addrinfo *result = NULL;
   int rc = getaddrinfo(host, port, NULL, &result);
   if (rc != 0 && rc != EAI_NONAME) {
-    err->error = RESOLVE_ADDR_ERROR_GETADDRINFO_FAILED;
+    err->error = GLR_GETADDRINFO_ERROR;
     err->sub_error = rc;
     glr_stringbuilder_printf(
         &err->msg, "%s:%d:%s getaddrinfo(%s, %s) failed rc=%d, err=%s\n",
@@ -1137,7 +1209,7 @@ struct sockaddr_storage glr_resolve_address(const char *host, const char *port,
   }
 
   if (!result || rc == EAI_NONAME) {
-    err->error = RESOLVE_ADDR_ERROR_NO_RESULT;
+    err->error = GLR_GETADDRINFO_NO_RESULT_ERROR;
     err->sub_error = 0;
     glr_stringbuilder_printf(
         &err->msg, "%s:%d:%s getaddrinfo(%s, %s) returned no result\n",
@@ -1175,7 +1247,7 @@ struct sockaddr_storage glr_resolve_address2(const char *addr, err_t *err) {
   }
 
   if (last_colon == NULL) {
-    err->error = RESOLVE_ADDR_ERROR_FAILED_TO_PARSE_ADDR_STR;
+    err->error = GLR_INVALID_ARGUMENT_ERROR;
     err->sub_error = 0;
     glr_stringbuilder_printf(
         &err->msg, "%s:%d:%s failed to split \"%s\" to host and port\n",
@@ -1216,8 +1288,839 @@ str_t glr_addr_to_string(const struct sockaddr_storage *addr) {
     str_t result = glr_stringbuilder_build(&sb);
     glr_stringbuilder_free_buffers(&sb);
     return result;
-  };
+  } break;
+  case AF_UNIX: {
+    stringbuilder_t sb = glr_make_stringbuilder(256);
+    glr_stringbuilder_append2(&sb, GLR_STR_LITERAL("unix:"));
+
+    const struct sockaddr_un *a = (struct sockaddr_un *) addr;
+    const char *path = a->sun_path;
+    if (path[0] == 0) {
+      path++;
+      glr_stringbuilder_append2(&sb, GLR_STR_LITERAL("@"));
+    }
+    glr_stringbuilder_append(&sb, path, strlen(path));
+
+    str_t result = glr_stringbuilder_build(&sb);
+    glr_stringbuilder_free_buffers(&sb);
+    return result;
+  } break;
   default:
     return GLR_STRDUP_LITERAL("Unsupported family");
   }
+}
+
+
+int glr_addr_get_port(const struct sockaddr_storage *addr) {
+  switch (addr->ss_family) {
+  case AF_INET: {
+    return ntohs(((struct sockaddr_in *)addr)->sin_port);
+  } break;
+  case AF_INET6: {
+    return ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+  } break;
+  default:
+    return -1;
+  }
+}
+
+
+struct sockaddr_storage glr_resolve_unix_socket_addr(const char *path) {
+  struct sockaddr_storage result = {};
+  struct sockaddr_un *s = (struct sockaddr_un *)&result;
+  s->sun_family = AF_UNIX;
+  strncpy(s->sun_path, path, sizeof(s->sun_path) - 1);
+  return result;
+}
+
+struct glr_fd_t {
+  glr_poll_t poll;
+  int64_t deadline;
+  uint32_t desired_epoll_flags;
+  glr_exec_context_t *ctx;
+  void *ssl;
+};
+
+static void glr_fd_poll_callback(glr_poll_t *poll) {
+  glr_fd_t *fd = poll->cb_arg;
+  if (poll->last_epoll_event_bitset & fd->desired_epoll_flags) {
+    glr_scheduler_add(fd->ctx);
+  }
+}
+
+glr_fd_t *glr_init_fd(int fd, err_t *err) {
+  if (err->error) return NULL;
+
+  glr_runtime_t *r = &glr_runtime;
+  glr_fd_t *result = NULL;
+
+  if (r->fd_freelist) {
+    result = r->fd_freelist;
+    r->fd_freelist = *(glr_fd_t **)result;
+  } else {
+    result = malloc(sizeof(glr_fd_t));
+  }
+
+  *result = (glr_fd_t){};
+  result->poll.fd = fd;
+  result->poll.cb_arg = result;
+  result->poll.cb = glr_fd_poll_callback;
+
+  glr_add_poll(&result->poll, EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET, err);
+  if (err->error) {
+    glr_stringbuilder_printf(&err->msg,
+                             "\n%s:%d:%s glr_add_poll() failed",
+                             __FILE__, __LINE__, __func__);
+    goto error_cleanup;
+  }
+
+  return result;
+error_cleanup:
+  if (result) {
+    *(glr_fd_t **) result = r->fd_freelist;
+    r->fd_freelist = result;
+  }
+  return NULL;
+}
+
+glr_fd_t *glr_listen(const struct sockaddr_storage *addr, int backlog,
+                     int reuse_addr, err_t *err) {
+  if (err->error) return NULL;
+
+  int fd = -1;
+
+  fd = socket(addr->ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    GLR_MAKE_POSIX_ERROR(err, "socket(...) failed");
+    goto cleanup_after_error;
+  }
+
+  if (reuse_addr) {
+    int reuse = reuse_addr;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+      GLR_MAKE_POSIX_ERROR(err, "setsockopt(SO_REUSEADDR) failed");
+      goto cleanup_after_error;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+      GLR_MAKE_POSIX_ERROR(err, "setsockopt(SO_REUSEPORT) failed");
+      goto cleanup_after_error;
+    }
+  }
+
+  size_t sockaddr_len = sizeof(*addr);
+  if (addr->ss_family == AF_UNIX) {
+    sockaddr_len = sizeof(struct sockaddr_un);
+  }
+  int rc = bind(fd, (const struct sockaddr *)(addr), sockaddr_len);
+  if (rc < 0) {
+    GLR_MAKE_POSIX_ERROR(err, "bind(...) failed");
+    goto cleanup_after_error;
+  }
+
+  rc = listen(fd, backlog);
+  if (rc < 0) {
+    GLR_MAKE_POSIX_ERROR(err, "listen(...) failed");
+    goto cleanup_after_error;
+  }
+
+  glr_fd_t *result = glr_init_fd(fd, err);
+  if (err->error) {
+    err->error = GLR_GENERAL_ERROR;
+    err->sub_error = 1;
+    glr_stringbuilder_printf(&err->msg, "\n%s:%d:%s glr_make_fd() failed",
+                             __FILE__, __LINE__, __func__);
+    goto cleanup_after_error;
+  }
+  return result;
+cleanup_after_error:
+  if (fd > 0) {
+    close(fd);
+  }
+  return NULL;
+}
+
+struct sockaddr_storage glr_socket_local_address(glr_fd_t *fd, err_t *err) {
+  if (err->error) return (struct sockaddr_storage){};
+
+  struct sockaddr_storage result = {};
+  socklen_t len = sizeof(result);
+  int rc = getsockname(fd->poll.fd, (struct sockaddr *)&result, &len);
+  if (rc != 0) {
+    GLR_MAKE_POSIX_ERROR(err, "getsockname(...) failed");
+    return result;
+  }
+  return result;
+
+}
+
+typedef struct {
+  int timer_fired;
+  glr_exec_context_t *ctx;
+} glr_fd_wait_timer_state_t;
+
+void glr_fd_wait_timer_cb(glr_timer_t *t) {
+  glr_fd_wait_timer_state_t *timer_state = t->arg;
+  timer_state->timer_fired = 1;
+  glr_scheduler_add(timer_state->ctx);
+}
+
+void glr_fd_wait_until(glr_fd_t *fd, int state, int64_t deadline, err_t *err) {
+  if (err->error) return;
+
+  glr_exec_context_t *cur_ctx = glr_current_context();
+  glr_fd_wait_timer_state_t timer_state = {};
+  timer_state.ctx = cur_ctx;
+
+  glr_timer_t t = {};
+  t.callback = glr_fd_wait_timer_cb;
+  t.arg = &timer_state;
+  t.deadline_posix_milliseconds = deadline;
+
+  if (deadline != 0) {
+    int64_t now = glr_timestamp_in_ms();
+    if (now >= deadline) {
+      err->error = GLR_TIMEOUT_ERROR;
+      err->msg = glr_make_stringbuilder(256);
+      glr_stringbuilder_printf(&err->msg, "%s:%d:%s deadline was reached",
+                               __FILE__, __LINE__, __func__);
+      return;
+    }
+    glr_add_timer(&t);
+  }
+
+  fd->ctx = cur_ctx;
+  fd->desired_epoll_flags = state;
+
+  glr_scheduler_yield(0);
+  fd->desired_epoll_flags = 0;
+
+  if (deadline != 0 && !timer_state.timer_fired) {
+    glr_remove_timer(&t);
+  }
+
+  if (deadline != 0 && timer_state.timer_fired) {
+    err->error = GLR_TIMEOUT_ERROR;
+    err->msg = glr_make_stringbuilder(256);
+    glr_stringbuilder_printf(&err->msg, "%s:%d:%s deadline was reached",
+                             __FILE__, __LINE__, __func__);
+    return;
+  }
+}
+
+void glr_close(glr_fd_t *fd) {
+  int rc = 0;
+  rc = close(fd->poll.fd);
+
+  if (rc != 0 && errno == EINTR) {
+    rc = close(fd->poll.fd);
+  }
+
+#ifdef GLR_SSL
+  if (fd->ssl) {
+    SSL_free(fd->ssl);
+  }
+#endif
+
+  glr_runtime_t *r = &glr_runtime;
+  *(glr_fd_t **) fd = r->fd_freelist;
+  r->fd_freelist = fd;
+}
+
+int glr_fd_get_native(glr_fd_t *fd) {
+  return fd->poll.fd;
+}
+
+glr_accept_result_t glr_raw_accept(glr_fd_t *listener, err_t *err) {
+  glr_accept_result_t result = {};
+  if (err->error) return result;
+
+  socklen_t len = sizeof(result.address);
+
+  for (;;) {
+    int fd = -1;
+    fd = accept4(glr_fd_get_native(listener),
+                 (struct sockaddr *)&result.address, &len,
+                 SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd >= 0) {
+      result.con = glr_init_fd(fd, err);
+      return result;
+    }
+
+    switch (errno) {
+    case ECONNABORTED:
+    case EINTR: {
+      continue;
+    } break;
+    //case EAGAIN:
+    case EWOULDBLOCK:
+    case ENETDOWN:
+    case EPROTO:
+    case ENOPROTOOPT:
+    case EHOSTDOWN:
+    case ENONET:
+    case EHOSTUNREACH:
+    case ENETUNREACH: {
+      glr_fd_wait_until(listener, EPOLLIN, 0, err);
+      if (err->error) {
+        glr_stringbuilder_printf(&err->msg, "\n%s:%d:%s glr_fd_wait_until failed",
+                                 __FILE__, __LINE__, __func__);
+        return (glr_accept_result_t){};
+      }
+    } break;
+    default: {
+      GLR_MAKE_POSIX_ERROR(err, "accept4() failed");
+      return result;
+    }
+    }
+  }
+}
+
+glr_fd_t *glr_raw_connect(const struct sockaddr_storage *addr, int64_t deadline, err_t *err) {
+  if (err->error) return NULL;
+  int fd = socket(addr->ss_family, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    GLR_MAKE_POSIX_ERROR(err, "socket() failed");
+    return NULL;
+  }
+
+  size_t sockaddr_len = sizeof(*addr);
+  if (addr->ss_family == AF_UNIX) {
+    sockaddr_len = sizeof(struct sockaddr_un);
+  }
+  int rc = 0;
+
+  do {
+    rc = connect(fd, (struct sockaddr *) addr, sockaddr_len);
+  } while (rc != 0 && errno == EINTR);
+  int saved_errno = errno;
+
+  if (rc && errno != EINPROGRESS) {
+    GLR_MAKE_POSIX_ERROR(err, "connect() failed");
+    close(fd);
+    return NULL;
+  }
+
+  glr_fd_t *result = glr_init_fd(fd, err);
+  if (err->error) {
+    glr_stringbuilder_printf(&err->msg, "\n%s:%d:%s glr_init_fd() failed",
+                             __FILE__, __LINE__, __func__);
+    close(fd);
+    return NULL;
+  }
+
+  if (saved_errno == EINPROGRESS) {
+    glr_fd_wait_until(result, EPOLLOUT|EPOLLHUP|EPOLLERR, deadline, err);
+    if (err->error) {
+      goto cleanup;
+    }
+    if (result->poll.last_epoll_event_bitset & (EPOLLHUP|EPOLLERR)) {
+      err->error = GLR_GENERAL_ERROR;
+      err->msg = glr_make_stringbuilder(256);
+      glr_stringbuilder_printf(
+          &err->msg,
+          "%s:%d:%s connection was interupted before connect was established",
+          __FILE__, __LINE__, __func__);
+      goto cleanup;
+    }
+  }
+
+  return result;
+cleanup:
+  glr_close(result);
+  return NULL;
+}
+
+void glr_fd_set_deadline(glr_fd_t *fd, int64_t deadline) {
+  fd->deadline = deadline;
+}
+
+int glr_fd_raw_send(glr_fd_t *fd, const char *data, int len, err_t *err) {
+  if (err->error) return -1;
+  for (;;) {
+    int result = send(glr_fd_get_native(fd), data, len, MSG_NOSIGNAL);
+    if (result >= 0) return result;
+    if (errno == EINTR) continue;
+    if (errno != EAGAIN) {
+      GLR_MAKE_POSIX_ERROR(err, ": syscall send(..., ..., %d) failed", len);
+      return -1;
+    }
+    glr_fd_wait_until(fd, EPOLLOUT|EPOLLHUP|EPOLLERR, fd->deadline, err);
+    if (err->error) {
+      glr_stringbuilder_printf(
+          &err->msg, "\n%s:%d:%s glr_fd_wait_until(EPOLLOUT|EPOLLHUP|EPOLLERR)",
+          __FILE__, __LINE__, __func__);
+      return -1;
+    }
+  }
+}
+
+
+int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, err_t *err) {
+  if (err->error) return -1;
+  for (;;) {
+    int result = recv(glr_fd_get_native(fd), data, len, MSG_NOSIGNAL);
+    if (result >= 0) return result;
+    if (errno == EINTR) continue;
+    if (errno != EAGAIN) {
+      GLR_MAKE_POSIX_ERROR(err, ": syscall recv(..., ..., %d) failed", len);
+      return -1;
+    }
+    glr_fd_wait_until(fd, EPOLLIN|EPOLLRDHUP|EPOLLERR, fd->deadline, err);
+    if (err->error) {
+      glr_stringbuilder_printf(
+          &err->msg, "\n%s:%d:%s glr_fd_wait_until(EPOLLIN|EPOLLRDHUP|EPOLLERR)",
+          __FILE__, __LINE__, __func__);
+      return -1;
+    }
+  }
+}
+
+void glr_fd_raw_shutdown(glr_fd_t *fd, err_t *err) {
+  if (err->error) return;
+  int result = shutdown(glr_fd_get_native(fd), SHUT_RDWR);
+  if (result == -1) {
+    GLR_MAKE_POSIX_ERROR(err, ": syscall shutdown(..., SHUT_RDWR) failed");
+  }
+}
+
+//SSL
+const char *glr_ssl_error = "GLR_SSL_ERROR";
+
+#ifdef GLR_SSL
+
+SSL_CTX *glr_ssl_server_context() {
+  SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+  SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
+  SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1);
+
+  // To avoid server trying to send data after main handshake causing
+  // unnecessary EPIPE
+  SSL_CTX_set_num_tickets(ctx, 0);
+
+  return ctx;
+}
+
+SSL_CTX *glr_ssl_client_context() {
+  SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+  SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
+  SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1);
+  SSL_CTX_set_default_verify_paths(ctx);
+
+  return ctx;
+}
+
+void glr_ssl_ctx_set_verify_peer(SSL_CTX *ctx, int verify) {
+  if (verify) {
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+  } else {
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+  }
+}
+
+static int glr_ssl_password_cb(char *buf, int size, int rwflag,
+                                void *u) {
+  (void)rwflag;
+  (void)size;
+  //TODO should look into case when buffer size is smaller than password
+  const char *passphrase = u;
+  int passphrase_length = strlen(passphrase);
+  memcpy(buf, passphrase, passphrase_length);
+  return passphrase_length;
+}
+
+void glr_ssl_ctx_set_key(SSL_CTX *ctx, const char *path,
+                             const char *password, err_t *error) {
+  if (error->error) return;
+
+  if (!SSL_CTX_use_PrivateKey_file(ctx, path, SSL_FILETYPE_PEM)) {
+    error->error = GLR_SSL_ERROR;
+    error->msg = glr_make_stringbuilder(256);
+    glr_stringbuilder_printf(&error->msg,
+                             "%s:%d:%s SSL_CTX failed to set PrivateKey file",
+                             __FILE__, __LINE__, __func__);
+    return;
+  }
+
+  if (password) {
+    SSL_CTX_set_default_passwd_cb_userdata(ctx, (void *)password);
+    SSL_CTX_set_default_passwd_cb(ctx, glr_ssl_password_cb);
+  }
+}
+
+void glr_ssl_ctx_set_cert(SSL_CTX *ctx, const char *path, err_t *error) {
+  if (error->error) return;
+
+  if (!SSL_CTX_use_certificate_chain_file(ctx, path)) {
+    error->error = GLR_SSL_ERROR;
+    error->msg = glr_make_stringbuilder(256);
+    glr_stringbuilder_printf(&error->msg,
+                             "%s:%d:%s SSL_CTX failed to set certificate file",
+                             __FILE__, __LINE__, __func__);
+
+  }
+}
+
+static int glr_ssl_bio_init(BIO *bio) {
+  BIO_set_init(bio, 1);
+  return 1;
+}
+
+static int glr_ssl_bio_write(BIO *bio, const char *data, int len) {
+  glr_fd_t *conn = BIO_get_data(bio);
+  err_t err = {};
+  int n = glr_fd_raw_send(conn, data, len, &err);
+  if (err.error) {
+    glr_err_cleanup(&err);
+    return -1;
+    //TODO: logging or error forwarding via glr_fd_t*
+  }
+  return n;
+}
+
+static int glr_ssl_bio_read(BIO *bio, char *data, int len) {
+  glr_fd_t *conn = BIO_get_data(bio);
+  err_t err = {};
+  int n = glr_fd_raw_recv(conn, data, len, &err);
+  if (err.error) {
+    glr_err_cleanup(&err);
+    return -1;
+    //TODO: logging or error forwarding via glr_fd_t*
+  }
+  return n;
+
+}
+
+static long glr_ssl_bio_ctrl(BIO *bio, int cmd, long num, void *user) {
+  (void) user;
+  (void) num;
+  (void) cmd;
+  (void) bio;
+  switch (cmd) {
+    case BIO_CTRL_FLUSH:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+BIO_METHOD *glr_ssl_get_bio_method() {
+  glr_runtime_t *r = glr_cur_thread_runtime();
+  if (!r->ssl_bio_method) {
+    int idx = BIO_get_new_index();
+    r->ssl_bio_method = BIO_meth_new(idx, "GLR ssl stream");
+    BIO_meth_set_create(r->ssl_bio_method, glr_ssl_bio_init);
+    BIO_meth_set_write(r->ssl_bio_method, glr_ssl_bio_write);
+    BIO_meth_set_read(r->ssl_bio_method, glr_ssl_bio_read);
+    BIO_meth_set_ctrl(r->ssl_bio_method, glr_ssl_bio_ctrl);
+  }
+  return r->ssl_bio_method;
+}
+
+static int glr_ssl_error_cb(const char *line, size_t len, void *data) {
+  stringbuilder_t *sb = data;
+  glr_stringbuilder_append(sb, line, len);
+  glr_stringbuilder_append(sb, "\n", 1);
+  return 1;
+}
+
+static str_t glr_ssl_get_error_msg() {
+  stringbuilder_t sb = glr_make_stringbuilder(256);
+  ERR_print_errors_cb(glr_ssl_error_cb, &sb);
+  return glr_stringbuilder_build(&sb);
+}
+
+void glr_ssl_client_conn_handshake(SSL_CTX *ctx, glr_fd_t *conn,
+                                   const char *hostname, int64_t deadline,
+                                   err_t *err) {
+  if (err->error) return;
+  SSL *ssl = SSL_new(ctx);
+  BIO *bio = BIO_new(glr_ssl_get_bio_method());
+  BIO_set_data(bio, conn);
+  SSL_set_bio(ssl, bio, bio);
+  SSL_set_connect_state(ssl);
+  BIO_set_conn_hostname(bio, hostname);
+  glr_fd_set_deadline(conn, deadline);
+  conn->ssl = ssl;
+
+  if (SSL_do_handshake(ssl) < 0) {
+    str_t err_str = glr_ssl_get_error_msg();
+    err->error = GLR_SSL_ERROR;
+    err->msg = glr_make_stringbuilder(256);
+    glr_stringbuilder_printf(&err->msg,
+                             "%s:%d:%s SSL_do_handshake failed: %.*s", __FILE__,
+                             __LINE__, __func__, err_str.len, err_str.data);
+    glr_free(err_str.data);
+    return;
+  }
+}
+
+void glr_ssl_server_conn_upgrade(SSL_CTX *ctx, glr_fd_t *conn, int64_t deadline,
+                     err_t *err) {
+  glr_fd_set_deadline(conn, deadline);
+
+  SSL *ssl = SSL_new(ctx);
+  conn->ssl = ssl;
+
+  BIO *bio = BIO_new(glr_ssl_get_bio_method());
+  BIO_set_data(bio, conn);
+  SSL_set_bio(ssl, bio, bio);
+  if (SSL_accept(ssl) < 0) {
+    str_t err_str = glr_ssl_get_error_msg();
+    err->error = GLR_SSL_ERROR;
+    err->msg = glr_make_stringbuilder(256);
+    glr_stringbuilder_printf(&err->msg,
+                             "%s:%d:%s SSL_do_handshake failed: %.*s", __FILE__,
+                             __LINE__, __func__, err_str.len, err_str.data);
+    glr_free(err_str.data);
+    return;
+  }
+}
+
+int glr_ssl_read(glr_fd_t *impl, char *buffer, size_t len, err_t *err) {
+  if (err->error) return 0;
+
+  SSL *ssl = impl->ssl;
+  int n = SSL_read(ssl, buffer, len);
+  if (glr_unlikely(n <= 0)) {
+    switch (SSL_get_error(ssl, n)) {
+      case SSL_ERROR_ZERO_RETURN: {
+        return 0;
+      } break;
+      default: {
+        str_t err_str = glr_ssl_get_error_msg();
+        err->error = GLR_SSL_ERROR;
+        err->msg = glr_make_stringbuilder(256);
+        glr_stringbuilder_printf(
+            &err->msg, "%s:%d:%s SSL_read failed: %.*s", __FILE__,
+            __LINE__, __func__, err_str.len, err_str.data);
+        glr_free(err_str.data);
+        return 0;
+      }
+    }
+  }
+  return n;
+}
+
+int glr_ssl_write(glr_fd_t *impl, const char *buffer, size_t len, err_t *err) {
+  SSL *ssl = impl->ssl;
+  int n = SSL_write(ssl, buffer, len);
+  if (glr_unlikely(n <= 0)) {
+    switch (SSL_get_error(ssl, n)) {
+      case SSL_ERROR_ZERO_RETURN: {
+        return 0;
+      } break;
+      default: {
+        str_t err_str = glr_ssl_get_error_msg();
+        err->error = GLR_SSL_ERROR;
+        err->msg = glr_make_stringbuilder(256);
+        glr_stringbuilder_printf(
+            &err->msg, "%s:%d:%s SSL_write failed: %.*s", __FILE__,
+            __LINE__, __func__, err_str.len, err_str.data);
+        glr_free(err_str.data);
+        return 0;
+      }
+    }
+  }
+  return n;
+}
+
+void glr_ssl_shutdown(glr_fd_t *impl) {
+  SSL *ssl = (SSL *) impl->ssl;
+  SSL_shutdown(ssl);
+}
+
+SSL *glr_fd_conn_get_ssl(glr_fd_t *impl) {
+  return impl->ssl;
+}
+
+SSL_CTX *glr_get_default_client_ssl_ctx() {
+  glr_runtime_t *r = glr_cur_thread_runtime();
+  if (!r->ssl_client_default_ctx) {
+    r->ssl_client_default_ctx = glr_ssl_client_context();
+  }
+  return r->ssl_client_default_ctx;
+}
+
+#endif
+
+//Network connection convenience
+glr_fd_t *glr_tcp_dial_hostname_port_ex(const char *host, const char *port,
+                                        int ssl, int64_t deadline, err_t *err) {
+  if (err->error) return NULL;
+  //FIXME: may block indefinetely in case of network issues
+  struct sockaddr_storage sockaddr = glr_resolve_address(host, port, err);
+  if (err->error) {
+    glr_stringbuilder_printf(&err->msg, "\n%s:%d:%s failed to resolve address",
+                             __FILE__, __LINE__, __func__);
+    return NULL;
+  }
+
+  glr_fd_t *conn = glr_raw_connect(&sockaddr, deadline, err);
+  if (err->error) {
+    glr_stringbuilder_printf(&err->msg, "\n%s:%d:%s failed to connect",
+                             __FILE__, __LINE__, __func__);
+    return NULL;
+  }
+
+#ifdef GLR_SSL
+  if (ssl) {
+    SSL_CTX *ctx = glr_get_default_client_ssl_ctx();
+
+    glr_ssl_client_conn_handshake(ctx, conn, host, deadline, err);
+
+    if (err->error) {
+      glr_stringbuilder_printf(&err->msg, "\n%s:%d:%s failed to perform ssl handshake",
+                               __FILE__, __LINE__, __func__);
+      return NULL;
+    }
+  }
+#endif
+
+  return conn;
+}
+
+glr_fd_t *glr_tcp_dial_addr(const char *addr, int64_t deadline, err_t *err) {
+  if (err->error) return NULL;
+
+  const char *host_begin = addr;
+  const char *last_colon = NULL;
+  const char *it = addr;
+
+  while (*it) {
+    if (*it == ':') {
+      last_colon = it;
+    }
+    ++it;
+  }
+
+  if (last_colon == NULL) {
+    err->error = GLR_INVALID_ARGUMENT_ERROR;
+    err->sub_error = 0;
+    glr_stringbuilder_printf(
+        &err->msg, "%s:%d:%s failed to split \"%s\" to host and port\n",
+        __FILE__, __LINE__, __func__, addr);
+
+    NULL;
+  }
+
+  const char *port_end = it;
+  const char *port_begin = last_colon + 1;
+  const char *host_end = last_colon;
+
+  char host[host_end - host_begin + 1];
+  char port[port_end - port_begin + 1];
+  strncpy(host, host_begin, host_end - host_begin);
+  host[host_end - host_begin] = 0;
+  strncpy(port, port_begin, port_end - port_begin);
+  port[port_end - port_begin] = 0;
+
+  return glr_tcp_dial_hostname_port_ex(host, port, 0, deadline, err);
+}
+
+glr_fd_t *glr_tcp_dial_hostname_port(const char *hostname, const char *port,
+                                     int64_t deadline, err_t *err) {
+  return glr_tcp_dial_hostname_port_ex(hostname, port, 0, deadline, err);
+}
+
+glr_fd_t *glr_tcp_dial_hostname_port2(const char *hostname, uint16_t port,
+                                      int64_t deadline, err_t *err) {
+  char port_buffer[7] = {0};
+  snprintf(port_buffer, sizeof(port_buffer), "%d", port);
+  return glr_tcp_dial_hostname_port_ex(hostname, port_buffer, 0, deadline, err);
+}
+
+#ifdef GLR_SSL
+glr_fd_t *glr_tcp_dial_addr_ssl(const char *addr, int64_t deadline, err_t *err) {
+  const char *host_begin = addr;
+  const char *last_colon = NULL;
+  const char *it = addr;
+
+  while (*it) {
+    if (*it == ':') {
+      last_colon = it;
+    }
+    ++it;
+  }
+
+  if (last_colon == NULL) {
+    err->error = GLR_INVALID_ARGUMENT_ERROR;
+    err->sub_error = 0;
+    glr_stringbuilder_printf(
+        &err->msg, "%s:%d:%s failed to split \"%s\" to host and port\n",
+        __FILE__, __LINE__, __func__, addr);
+
+    NULL;
+  }
+
+  const char *port_end = it;
+  const char *port_begin = last_colon + 1;
+  const char *host_end = last_colon;
+
+  char host[host_end - host_begin + 1];
+  char port[port_end - port_begin + 1];
+  strncpy(host, host_begin, host_end - host_begin);
+  host[host_end - host_begin] = 0;
+  strncpy(port, port_begin, port_end - port_begin);
+  port[port_end - port_begin] = 0;
+
+  return glr_tcp_dial_hostname_port_ex(host, port, 1, deadline, err);
+}
+
+glr_fd_t *glr_tcp_dial_hostname_port_ssl(const char *hostname, const char *port,
+                                         int64_t deadline, err_t *err) {
+
+  return glr_tcp_dial_hostname_port_ex(hostname, port, 1, deadline, err);
+}
+
+glr_fd_t *glr_tcp_dial_hostname_port_ssl2(const char *hostname, uint16_t port,
+                                          int64_t deadline, err_t *err) {
+  char port_buffer[7] = {0};
+  snprintf(port_buffer, sizeof(port_buffer), "%d", port);
+  return glr_tcp_dial_hostname_port_ex(hostname, port_buffer, 1, deadline, err);
+}
+
+#endif
+
+int glr_fd_conn_send(glr_fd_t *conn, const char *data, size_t len, err_t *err) {
+  if (err->error) return -1;
+#ifdef GLR_SSL
+  if (conn->ssl) return glr_ssl_write(conn, data, len, err);
+#endif
+  return glr_fd_raw_send(conn, data, len, err);
+}
+
+int glr_fd_conn_recv(glr_fd_t *conn, char *data, size_t len, err_t *err) {
+  if (err->error) return -1;
+#ifdef GLR_SSL
+  if (conn->ssl) return glr_ssl_read(conn, data, len, err);
+#endif
+  return glr_fd_raw_recv(conn, data, len, err);
+}
+
+void glr_fd_conn_shutdown(glr_fd_t *conn, err_t *err) {
+  if (err->error) return;
+#ifdef GLR_SSL
+  if (conn->ssl) return glr_ssl_shutdown(conn);
+#endif
+  return glr_fd_raw_shutdown(conn, err);
+}
+
+int glr_fd_conn_send_exactly(glr_fd_t *conn, const char *data, size_t len, err_t *err) {
+  size_t sent = 0;
+  while (sent < len) {
+    int n = glr_fd_conn_send(conn, data + sent, len - sent, err);
+    if (n <= 0 || err->error) return sent;
+    sent += n;
+  }
+  return sent;
+}
+
+int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, err_t *err) {
+  size_t have_read = 0;
+  while (have_read < len) {
+    int n = glr_fd_conn_recv(conn, data + have_read, len - have_read, err);
+    if (n <= 0 || err->error) return have_read;
+    have_read += n;
+  }
+  return have_read;
 }
