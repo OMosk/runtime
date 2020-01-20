@@ -39,6 +39,9 @@
 
 #define glr_unlikely(cond) __builtin_expect(!!(cond), 0)
 
+#define GLR_TRACE fprintf(stderr, "%s:%d:%s\n", __FILE__, __LINE__, __func__)
+#define GLR_TRACES(X) fprintf(stderr, "%s:%d:%s " X "\n", __FILE__, __LINE__, __func__)
+
 struct glr_exec_stack_t {
   void *original_allocation;
   void *sptr;
@@ -104,6 +107,11 @@ typedef struct glr_runtime_t {
 #ifdef GLR_SSL
   BIO_METHOD *ssl_bio_method;
   SSL_CTX *ssl_client_default_ctx;
+#endif
+
+#ifdef GLR_CURL
+  CURLM *curl_multi_handle;
+  glr_timer_t curl_timer;
 #endif
 
   char strerror_r_buffer[256];
@@ -374,7 +382,7 @@ void glr_stringbuilder_alloc_block(stringbuilder_t *sb, size_t cap) {
     sb->cap = new_cap;
 
     memcpy(sb->blocks, old_blocks, old_blocks_cap * sizeof(str_t));
-    free(old_blocks);
+    glr_free(old_blocks);
   }
 
   sb->blocks[sb->len].cap = cap;
@@ -607,6 +615,12 @@ void glr_cur_thread_runtime_cleanup() {
   }
   if (r->ssl_client_default_ctx) {
     SSL_CTX_free(r->ssl_client_default_ctx);
+  }
+#endif
+
+#ifdef GLR_CURL
+  if (r->curl_multi_handle) {
+    curl_multi_cleanup(r->curl_multi_handle);
   }
 #endif
 
@@ -1096,13 +1110,19 @@ void glr_remove_timer(glr_timer_t *t) {
   if (idx >= r->timers_len) {
     //TODO: log message should be here
     //this is caused by error of library user
-    abort();
+    //abort();
+    return;
+    //will treat timers as set, trying to remove item from set that is not there probably not an error
+    //this behavior is used for timer in curl multi handle thing
   }
 
   if (r->timers[idx] != t) {
     //TODO: log message should be here
     //this is caused by error of library user
-    abort();
+    //abort();
+    //will treat timers as set, trying to remove item from set that is not there probably not an error
+    //this behavior is used for timer in curl multi handle thing
+    return;
   }
 
   r->timers[idx] = r->timers[r->timers_len - 1];
@@ -2124,3 +2144,226 @@ int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, err_t *err)
   }
   return have_read;
 }
+
+#ifdef GLR_CURL
+const char *glr_curl_error = "GLR_CURL_ERROR";
+
+typedef struct {
+  glr_exec_context_t *in_context;
+  CURLcode out_response_code;
+  err_t *err;
+} glr_curl_callback_info_t;
+
+typedef struct {
+  glr_poll_t poll_handle;
+  curl_socket_t sockfd;
+  CURLM *multi_info;
+} glr_curl_socket_data_t;
+
+void glr_curl_check_multi_info();
+void glr_curl_on_timeout(glr_timer_t *req);
+int glr_curl_handle_socket(CURL * /*easy*/, curl_socket_t s, int action,
+                          void *userp, void *socketp);
+int glr_curl_start_timer(CURLM * /*multi*/, long timeout_ms, void *userp);
+
+CURLM *glr_get_curl_multi_handle(err_t *err) {
+  if (err->error) return NULL;
+  glr_runtime_t *r = glr_cur_thread_runtime();
+  if (!r->curl_multi_handle) {
+    r->curl_multi_handle = curl_multi_init();
+    if (!r->curl_multi_handle) {
+      err->error = GLR_CURL_ERROR;
+      err->msg = glr_make_stringbuilder(256);
+      glr_stringbuilder_printf(&err->msg,
+                               "%s:%d:%s failed to init multi handle", __FILE__,
+                               __LINE__, __func__);
+      return NULL;
+    }
+    curl_multi_setopt(r->curl_multi_handle, CURLMOPT_SOCKETFUNCTION,
+                      glr_curl_handle_socket);
+    curl_multi_setopt(r->curl_multi_handle, CURLMOPT_SOCKETDATA,
+                      r->curl_multi_handle);
+    curl_multi_setopt(r->curl_multi_handle, CURLMOPT_TIMERFUNCTION,
+                      glr_curl_start_timer);
+  }
+  return r->curl_multi_handle;
+}
+
+void glr_curl_check_multi_info(CURLM *multi_handle) {
+  CURLMsg *message;
+  int pending;
+  CURL *easy_handle;
+  glr_curl_callback_info_t *request;
+
+  while ((message = curl_multi_info_read(multi_handle, &pending))) {
+    switch (message->msg) {
+      case CURLMSG_DONE:
+        easy_handle = message->easy_handle;
+        curl_easy_getinfo(easy_handle, CURLINFO_PRIVATE, &request);
+        if (request) {
+          request->out_response_code = message->data.result;
+          glr_scheduler_add(request->in_context);
+        }
+        curl_multi_remove_handle(multi_handle, easy_handle);
+        break;
+      default:
+        // fprintf(stderr, "CURLMSG default\n");
+        break;
+    }
+  }
+}
+
+void glr_curl_perform_internal(glr_poll_t *req) {
+  glr_curl_socket_data_t *context = req->cb_arg;
+  CURLM *multi_info = context->multi_info;
+  int flags = 0;
+  if (context->poll_handle.last_epoll_event_bitset & EPOLLIN)
+    flags |= CURL_CSELECT_IN;
+  if (context->poll_handle.last_epoll_event_bitset & EPOLLOUT)
+    flags |= CURL_CSELECT_OUT;
+  if (context->poll_handle.last_epoll_event_bitset & EPOLLERR)
+    flags |= CURL_CSELECT_ERR;
+
+  int running_handles;
+  curl_multi_socket_action(multi_info, context->sockfd,
+                               flags, &running_handles);
+  glr_curl_check_multi_info(multi_info);
+}
+
+void glr_curl_on_timeout(glr_timer_t *req) {
+  CURLM *multi_info = req->arg;
+  int running_handles;
+  curl_multi_socket_action(multi_info, CURL_SOCKET_TIMEOUT, 0,
+                               &running_handles);
+  glr_curl_check_multi_info(multi_info);
+}
+
+int glr_curl_start_timer(CURLM *multi_info, long timeout_ms, void *userp) {
+  (void) userp;
+  glr_runtime_t *r = glr_cur_thread_runtime();
+  if (timeout_ms < 0) {
+    glr_remove_timer(&r->curl_timer);
+  } else {
+    if (timeout_ms == 0) {
+      timeout_ms = 1; /* 0 means directly call socket_action, but we'll do it
+                         in a bit */
+    }
+    int64_t now = glr_timestamp_in_ms();
+    r->curl_timer.deadline_posix_milliseconds = now + timeout_ms;
+    r->curl_timer.callback = glr_curl_on_timeout;
+    r->curl_timer.arg = multi_info;
+    glr_remove_timer(&r->curl_timer);
+    glr_add_timer(&r->curl_timer);
+  }
+  return 0;
+}
+
+glr_curl_socket_data_t *glr_curl_create_socket(curl_socket_t sockfd,
+                                               CURLM *multi_info, err_t *err) {
+  glr_curl_socket_data_t *context = malloc(sizeof(glr_curl_socket_data_t));
+  context->sockfd = sockfd;
+  context->multi_info = multi_info;
+
+  context->poll_handle = (glr_poll_t){};
+  context->poll_handle.fd = sockfd;
+  context->poll_handle.cb_arg = context;
+  glr_add_poll(&context->poll_handle, 0, err);
+  if (err->error) {
+    glr_stringbuilder_printf(&err->msg,
+                             "\n%s:%d:%s failed to add poll of curl socket",
+                             __FILE__, __LINE__, __func__);
+    free(context);
+    return NULL;
+  }
+
+  return context;
+}
+
+int glr_curl_handle_socket(CURL *easy, curl_socket_t s, int action,
+                          void *userp, void *socketp) {
+
+  CURLM *multi_info = userp;
+  glr_curl_callback_info_t *info = NULL;
+  curl_easy_getinfo(easy, CURLINFO_PRIVATE, &info);
+
+  err_t *err = info->err;
+  glr_curl_socket_data_t *curl_context;
+  switch (action) {
+    case CURL_POLL_IN:
+    case CURL_POLL_OUT:
+    case CURL_POLL_INOUT: {
+      curl_context = socketp ? socketp
+                             : glr_curl_create_socket(s, multi_info, err);
+      if (err->error) {
+        glr_stringbuilder_printf(
+            &err->msg, "\n%s:%d:%s failed to init glr structure for curl socket",
+            __FILE__, __LINE__, __func__);
+        return 1;
+      }
+      curl_multi_assign(multi_info, s, curl_context);
+
+      int kind = ((action & CURL_POLL_IN) ? EPOLLIN : 0) |
+                 ((action & CURL_POLL_OUT) ? EPOLLOUT : 0);
+
+      glr_change_poll(&curl_context->poll_handle, kind, err);
+      if (err->error) {
+        glr_stringbuilder_printf(
+            &err->msg, "\n%s:%d:%s failed to change poll flags of curl socket",
+            __FILE__, __LINE__, __func__);
+        return 1;
+      }
+
+      curl_context->poll_handle.cb = glr_curl_perform_internal;
+    } break;
+    case CURL_POLL_REMOVE:
+      if (socketp) {
+        curl_context = socketp;
+        glr_remove_poll(&curl_context->poll_handle, err);
+        curl_multi_assign(multi_info, s, NULL);
+        free(socketp);
+        if (err->error) {
+          glr_stringbuilder_printf(
+              &err->msg, "\n%s:%d:%s failed to remove poll of curl socket",
+              __FILE__, __LINE__, __func__);
+          return 1;
+        }
+      }
+      break;
+    default:
+      abort();
+  }
+  return 0;
+}
+
+
+
+CURLcode glr_curl_perform(CURL *handle, err_t *err) {
+  if (err->error) return 0;
+
+
+  glr_curl_callback_info_t info = {};
+  info.in_context = glr_current_context();
+  info.out_response_code = CURLE_OK;
+  info.err = err;
+
+  void *old_private;
+  curl_easy_getinfo(handle, CURLINFO_PRIVATE, &old_private);
+
+  curl_easy_setopt(handle, CURLOPT_PRIVATE, &info);
+  CURLM *multi_handle = glr_get_curl_multi_handle(err);
+  if (err->error) {
+    glr_stringbuilder_printf(&err->msg,
+                             "\n%s:%d:%s failed to get curl multi handle",
+                             __FILE__, __LINE__, __func__);
+    return CURLE_OK;
+  }
+  curl_multi_add_handle(multi_handle, handle);
+
+  glr_scheduler_yield(0);
+
+  curl_easy_setopt(handle, CURLOPT_PRIVATE, old_private);
+
+  return info.out_response_code;
+}
+
+#endif

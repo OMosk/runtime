@@ -3,6 +3,7 @@
 //Features
 #define GLR_VALGRIND
 #define GLR_SSL
+#define GLR_CURL
 
 #define _GNU_SOURCE 1
 #include <stddef.h>
@@ -13,6 +14,11 @@
 #ifdef GLR_SSL
 #   include <openssl/ossl_typ.h>
 #endif
+
+#ifdef GLR_CURL
+#   include <curl/curl.h>
+#endif
+
 
 enum {
   GLR_ALLOCATOR_ALLOC,
@@ -273,3 +279,10 @@ void glr_fd_conn_shutdown(glr_fd_t *conn, err_t *err);
 int glr_fd_conn_send_exactly(glr_fd_t *conn, const char *data, size_t len, err_t *err);
 int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, err_t *err);
 
+#ifdef GLR_CURL
+
+extern const char *glr_curl_error;
+#define GLR_CURL_ERROR (&glr_curl_error)
+
+CURLcode glr_curl_perform(CURL *handle, err_t *err);
+#endif

@@ -2,7 +2,7 @@ COV_FLAGS:=-fprofile-instr-generate -fcoverage-mapping
 ADDITIONAL_CHECKS:=-Wall -Wextra #-Werror
 CFLAGS:=$(ADDITIONAL_CHECKS) $(COV_FLAGS) -march=native -pthread
 #CFLAGS:=$(ADDITIONAL_CHECKS) -O3 -march=native -pthread
-LIBS:=-l:libssl.a -l:libcrypto.a -ldl
+LIBS:=-l:libssl.a -l:libcrypto.a -ldl -lcurl
 b:
 	time clang -g $(CFLAGS) all.c -o test $(LIBS)
 

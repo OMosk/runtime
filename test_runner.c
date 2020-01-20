@@ -1553,6 +1553,89 @@ static void test_fd_conn_functions() {
   glr_cur_thread_runtime_cleanup();
 }
 
+typedef struct {
+  glr_allocator_t a;
+  stringbuilder_t sb;
+} curl_perform_test_data_t;
+
+size_t curl_perform_write_cb(void *contents, size_t size, size_t nmemb,
+                             void *userp) {
+  (void) userp;
+  size_t realsize = size * nmemb;
+  curl_perform_test_data_t *td = userp;
+  glr_push_allocator(&td->a);
+  glr_stringbuilder_append(&td->sb, contents, realsize);
+  glr_pop_allocator();
+  //printf("received %lu bytes, total=%lu\n", realsize, response_body->size());
+  return realsize;
+}
+
+static void curl_perform_test(const char *url, ssize_t expected_size) {
+  printf("\n%s:%d:%s %s Started\n", __FILE__, __LINE__, __func__, url);
+
+  curl_global_init(CURL_GLOBAL_ALL);
+  CURL *curl = curl_easy_init();
+  if (!curl) {
+    abort();
+  }
+
+  CURLcode res = CURLE_OK;
+
+  curl_perform_test_data_t td = {};
+  td.a = glr_get_transient_allocator(NULL);
+  glr_push_allocator(&td.a);
+  td.sb = glr_make_stringbuilder(4096);
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_perform_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &td);
+  curl_easy_setopt(curl, CURLOPT_PRIVATE, url);
+  //curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+  //curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, my_trace);
+  err_t e = {};
+  res = glr_curl_perform(curl, &e);
+  if (e.error) {
+    str_t msg = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s",
+        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    abort();
+  }
+
+  const char *p;
+  curl_easy_getinfo(curl, CURLINFO_PRIVATE, &p);
+
+  if (url != p) {
+    fprintf(stderr, "CurlPerform messed up private pointer\n");
+    abort();
+  }
+
+  if (res != CURLE_OK) {
+    const char *what = curl_easy_strerror(res);
+    fprintf(stderr, "curl_easy_perform() failed: %s\n", what);
+    abort();
+  }
+
+  str_t response = glr_stringbuilder_build(&td.sb);
+
+  if (response.len == 0) {
+    abort();
+  }
+
+  printf("%s:%d:%s %s response is %u bytes long\n",
+         __FILE__, __LINE__, __func__, url, response.len);
+
+  if (expected_size >= 0 && response.len != (size_t)expected_size) {
+    abort();
+  }
+
+  curl_easy_cleanup(curl);
+
+  curl_global_cleanup();
+  glr_destroy_allocator(&td.a);
+  glr_cur_thread_runtime_cleanup();
+  printf("%s:%d:%s %s DONE\n", __FILE__, __LINE__, __func__, url);
+}
+
 int main() {
   int async_tests_enabled = 0;
   int dns_tests_enabled = 0;
@@ -1626,4 +1709,11 @@ int main() {
   test_ssl_accept();
   test_convenient_connect();
   test_fd_conn_functions();
+
+  curl_perform_test("http://example.com", -1);
+  curl_perform_test("https://example.com", -1);
+  curl_perform_test("https://httpbin.org/bytes/10000", 10000);
+  curl_perform_test("https://httpbin.org/bytes/100000", 100000);
+  curl_perform_test("https://www.google.com", -1);
+
 }
