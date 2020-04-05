@@ -1,22 +1,19 @@
-#include <stdio.h>
 #include <malloc.h>
-#include <time.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <pthread.h>
 #include <stdalign.h>
+#include <stdatomic.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <stdio.h>
-#include <time.h>
-#include <sys/eventfd.h>
-#include <unistd.h>
+#include <stdlib.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <sys/socket.h>
-#include <pthread.h>
-#include <stdatomic.h>
-
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "glr.h"
 
@@ -40,20 +37,20 @@ static void error_handling(void) {
   TEST;
   void *cleanup = &&exit;
 
-  int *a = (int*) malloc(sizeof(int));
+  int *a = (int *)malloc(sizeof(int));
   if (!a) goto *cleanup;
   cleanup = &&free_variable_a;
 
   *a = 5;
 
   if (time(NULL) % 2) {
-    //Unexpected error
+    // Unexpected error
     printf("%s:%d:%s Caught expected error returning with appropiate cleanup\n",
            __FILE__, __LINE__, __func__);
     goto *cleanup;
   }
 
-  int *b = (int*) malloc(sizeof(int));
+  int *b = (int *)malloc(sizeof(int));
   if (!b) goto *cleanup;
   cleanup = &&free_variable_b;
 
@@ -74,12 +71,12 @@ exit:
 
 static void test_global_malloc_free_adapter() {
   TEST;
-  glr_allocator_t global = glr_get_default_allocator();
-  int *a = (int *) glr_allocator_alloc(&global, sizeof(int), alignof(int));
+  glr_allocator_t *global = glr_get_default_allocator();
+  int *a = (int *)glr_allocator_alloc(global, sizeof(int), alignof(int));
   *a = 5;
-  glr_allocator_free(&global, a);
-  glr_reset_allocator(&global);
-  glr_destroy_allocator(&global);
+  glr_allocator_free(global, a);
+  glr_reset_allocator(global);
+  glr_destroy_allocator(global);
 }
 
 static void test_body_transient_allocator(glr_allocator_t *alloc) {
@@ -100,38 +97,39 @@ static void test_body_transient_allocator(glr_allocator_t *alloc) {
     ssize_t size;
     size_t alignment;
     void *result_ptr;
-  } *c, cases[] = {
-    {"int", sizeof(int), alignof(int), NULL},
-    {"float", sizeof(float), alignof(float), NULL},
-    {"uint8_t", sizeof(uint8_t), alignof(uint8_t), NULL},
-    {"int64_t", sizeof(int64_t), alignof(int64_t), NULL},
-    {"double", sizeof(double), alignof(double), NULL},
-    {"char[256]", sizeof(char[256]), alignof(char[256]), NULL},
-    {"test_struct_t", sizeof(test_struct_t), alignof(test_struct_t), NULL},
-    {"char[9600]", sizeof(char[9600]), alignof(char[9600]), NULL},
-    {"uint8_t", sizeof(uint8_t), alignof(uint8_t), NULL},
-  };
+  } * c, cases[] = {
+             {"int", sizeof(int), alignof(int), NULL},
+             {"float", sizeof(float), alignof(float), NULL},
+             {"uint8_t", sizeof(uint8_t), alignof(uint8_t), NULL},
+             {"int64_t", sizeof(int64_t), alignof(int64_t), NULL},
+             {"double", sizeof(double), alignof(double), NULL},
+             {"char[256]", sizeof(char[256]), alignof(char[256]), NULL},
+             {"test_struct_t", sizeof(test_struct_t), alignof(test_struct_t),
+              NULL},
+             {"char[9600]", sizeof(char[9600]), alignof(char[9600]), NULL},
+             {"uint8_t", sizeof(uint8_t), alignof(uint8_t), NULL},
+         };
 
   int cases_len = sizeof(cases) / sizeof(cases[0]);
   for (int i = 0; i < cases_len; ++i) {
-    cases[i].result_ptr
-        = glr_allocator_alloc(alloc, cases[i].size, cases[i].alignment);
+    cases[i].result_ptr =
+        glr_allocator_alloc(alloc, cases[i].size, cases[i].alignment);
   }
 
   for (int i = 0; i < cases_len; ++i) {
     c = cases + i;
-    int aligned = ((uintptr_t) c->result_ptr % c->alignment) == 0;
+    int aligned = ((uintptr_t)c->result_ptr % c->alignment) == 0;
     ssize_t ptrdiff_to_next = 0;
     int enough_size = 1;
     if (i < cases_len - 1) {
-      ptrdiff_to_next = ((char *)(c+1)->result_ptr - (char *)c->result_ptr);
+      ptrdiff_to_next = ((char *)(c + 1)->result_ptr - (char *)c->result_ptr);
       enough_size = ptrdiff_to_next >= c->size;
     }
-    printf("Alloc %s size=%ld alignment=%ld data=%p aligned=%d "
-           "ptrdiff=%ld enough_size=%d\n",
-           c->comment, c->size, c->alignment, c->result_ptr, aligned,
-           ptrdiff_to_next, enough_size
-           );
+    printf(
+        "Alloc %s size=%ld alignment=%ld data=%p aligned=%d "
+        "ptrdiff=%ld enough_size=%d\n",
+        c->comment, c->size, c->alignment, c->result_ptr, aligned,
+        ptrdiff_to_next, enough_size);
 
     char *data = c->result_ptr;
     for (char *it = data, *end = data + c->size; it < end; ++it) {
@@ -144,7 +142,7 @@ static void test_body_transient_allocator(glr_allocator_t *alloc) {
 
 static void test_transient_allocator() {
   TEST;
-  glr_allocator_t alloc = glr_get_transient_allocator(NULL);
+  glr_allocator_t alloc = glr_create_transient_allocator(NULL);
 
   test_body_transient_allocator(&alloc);
 
@@ -159,11 +157,11 @@ static void test_transient_allocator() {
 static void test_transient_allocator2() {
   TEST;
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
-  //Allocating in way that forces transient allocator allocate 3 4096 blocks
-  //resetting allocator, request allocating of 8192, 0th block would not be able
-  //to contain this data as 1st, so it should allocated 8192 block and swap it
-  //with 1st
-  glr_allocator_t alloc = glr_get_transient_allocator(NULL);
+  // Allocating in way that forces transient allocator allocate 3 4096 blocks
+  // resetting allocator, request allocating of 8192, 0th block would not be
+  // able to contain this data as 1st, so it should allocated 8192 block and swap
+  // it with 1st
+  glr_allocator_t alloc = glr_create_transient_allocator(NULL);
 
   glr_allocator_alloc(&alloc, 4096, 1);
   glr_allocator_alloc(&alloc, 4096, 1);
@@ -180,12 +178,12 @@ static void test_transient_allocator2() {
 
 static void test_glr_sprintf() {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
 
   printf("%s:%d:%s Float=%.6f'\n", __FILE__, __LINE__, __func__, 123.45);
 
-  str_t string = glr_sprintf_ex(&a, "%s:%d:%s Float=%.6fEnd",
-                               __FILE__, __LINE__, __func__, 123.45);
+  str_t string = glr_sprintf_ex(&a, "%s:%d:%s Float=%.6fEnd", __FILE__,
+                                __LINE__, __func__, 123.45);
 
   fwrite(string.data, 1, string.len, stdout);
   printf("\n");
@@ -208,7 +206,7 @@ static void test_allocators_stack() {
     abort();
   }
 
-  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   glr_allocator_t *cur = glr_current_allocator();
@@ -229,7 +227,7 @@ static void test_allocators_stack() {
 
 static void test_stringbuilder() {
   TEST;
-  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   stringbuilder_t sb = glr_make_stringbuilder(256);
@@ -254,7 +252,7 @@ static void test_stringbuilder() {
 
 static void test_stringbuilder2() {
   TEST;
-  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   stringbuilder_t sb = glr_make_stringbuilder(5);
@@ -278,8 +276,8 @@ static void test_stringbuilder2() {
 static void test_stringbuilder3() {
   TEST;
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
-  //testing append
-  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  // testing append
+  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   const char str[] = "'Hello World'";
@@ -310,7 +308,7 @@ static void test_stringbuilder3() {
 
 static void test_stringbuilder4() {
   TEST;
-  //Test buffers cleanup
+  // Test buffers cleanup
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   stringbuilder_t sb = glr_make_stringbuilder(5);
   const char str[] = "'Hello World'";
@@ -336,8 +334,8 @@ static void bench_emptysnprintf_len_calculation() {
   }
   struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
-  int64_t elapsed = (end.tv_sec - start.tv_sec) * 1e9 +
-      (end.tv_nsec - start.tv_nsec);
+  int64_t elapsed =
+      (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec);
   printf("%d iterations took = %f secs\n", n, elapsed / 1e9);
 }
 
@@ -347,13 +345,13 @@ static void bench_snprintf_len_calculation() {
   clock_gettime(CLOCK_MONOTONIC, &start);
   int n = 10000;
   for (int i = 0; i < n; ++i) {
-    (void)snprintf(NULL, 0, "String='%s' int='%d' float='%f'\n",
-                   "Hello world", 12345, 987.654);
+    (void)snprintf(NULL, 0, "String='%s' int='%d' float='%f'\n", "Hello world",
+                   12345, 987.654);
   }
   struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
-  int64_t elapsed = (end.tv_sec - start.tv_sec) * 1e9 +
-      (end.tv_nsec - start.tv_nsec);
+  int64_t elapsed =
+      (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec);
   printf("%d iterations took = %f secs\n", n, elapsed / 1e9);
 }
 
@@ -363,13 +361,13 @@ static void bench_snprintf_len_calculation2() {
   clock_gettime(CLOCK_MONOTONIC, &start);
   int n = 10000;
   for (int i = 0; i < n; ++i) {
-    (void)snprintf(NULL, 0, "String='%.*s' int='%d' float='%f'\n",
-                   11, "Hello world", 12345, 987.654);
+    (void)snprintf(NULL, 0, "String='%.*s' int='%d' float='%f'\n", 11,
+                   "Hello world", 12345, 987.654);
   }
   struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
-  int64_t elapsed = (end.tv_sec - start.tv_sec) * 1e9 +
-      (end.tv_nsec - start.tv_nsec);
+  int64_t elapsed =
+      (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec);
   printf("%d iterations took = %f secs\n", n, elapsed / 1e9);
 }
 
@@ -388,7 +386,7 @@ static void test_coro_func(void *arg) {
 
 static void test_coro_transfer() {
   TEST;
-  coro_transfer_test_data tdata = { glr_current_context(), 0};
+  coro_transfer_test_data tdata = {glr_current_context(), 0};
   glr_exec_context_t *coro_ctx = glr_get_context_from_freelist();
   glr_create_coro(coro_ctx, test_coro_func, &tdata);
   glr_transfer(tdata.main_ctx, coro_ctx);
@@ -411,7 +409,7 @@ static void test_coro_func2(void *arg) {
 
 static void test_scheduler() {
   TEST;
-  coro_transfer_test_data tdata = { glr_current_context(), 0};
+  coro_transfer_test_data tdata = {glr_current_context(), 0};
   glr_go(test_coro_func2, &tdata);
   glr_scheduler_yield(1);
 
@@ -431,7 +429,7 @@ static void test_coro_func3(void *arg) {
 
 static void test_scheduler_resizing() {
   TEST;
-  coro_transfer_test_data tdata = { glr_current_context(), 0};
+  coro_transfer_test_data tdata = {glr_current_context(), 0};
   glr_go(test_coro_func3, &tdata);
   glr_go(test_coro_func3, &tdata);
   glr_go(test_coro_func3, &tdata);
@@ -466,8 +464,8 @@ static void test_coro_func4(void *arg) {
 
 static void test_scheduler_execution() {
   TEST;
-  //to mess with indexes in scheduler ring buffer
-  coro_transfer_test_data tdata = { glr_current_context(), 0};
+  // to mess with indexes in scheduler ring buffer
+  coro_transfer_test_data tdata = {glr_current_context(), 0};
   glr_go(test_coro_func3, &tdata);
   glr_go(test_coro_func3, &tdata);
   glr_go(test_coro_func3, &tdata);
@@ -483,7 +481,7 @@ static void test_scheduler_execution() {
     glr_go(test_coro_func4, arr + i);
   }
   glr_scheduler_yield(1);
-  if (sum != 8128) {//sum of arithmetic progression
+  if (sum != 8128) {  // sum of arithmetic progression
     abort();
   }
 
@@ -492,7 +490,7 @@ static void test_scheduler_execution() {
 }
 
 void poll_test_coro(void *arg) {
-  uintptr_t large_fd = (uintptr_t) arg;
+  uintptr_t large_fd = (uintptr_t)arg;
   int fd = large_fd;
   int64_t add = 5;
   printf("Written to fd=%d\n", fd);
@@ -504,12 +502,12 @@ void poll_test_coro(void *arg) {
 
 static void test_poll() {
   TEST;
-  err_t err = {};
+  glr_error_t err = {};
   int fd = eventfd(0, EFD_NONBLOCK);
   printf("Inited fd=%d\n", fd);
   uintptr_t large_fd = fd;
   glr_go(poll_test_coro, (void *)large_fd);
-  int rc = glr_wait_for(fd, EPOLLIN|EPOLLET, &err);
+  int rc = glr_wait_for(fd, EPOLLIN | EPOLLET, &err);
 
   int64_t new_val = 0;
   rc = read(fd, &new_val, 8);
@@ -527,9 +525,9 @@ static void test_poll() {
 
 static void test_error_handling() {
   TEST;
-  err_t err = {};
+  glr_error_t err = {};
   int fd = 1213456;
-  glr_wait_for(fd, EPOLLIN|EPOLLET, &err);
+  glr_wait_for(fd, EPOLLIN | EPOLLET, &err);
   if (err.error) {
     str_t msg = glr_stringbuilder_build(&err.msg);
     printf("Expected error: %*s\n", msg.len, msg.data);
@@ -544,10 +542,10 @@ static void test_error_handling() {
 
 static void test_transient_allocator_embedding() {
   TEST;
-  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
-  glr_allocator_t a2 = glr_get_transient_allocator(NULL);
+  glr_allocator_t a2 = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a2);
 
   stringbuilder_t sb = {};
@@ -562,7 +560,7 @@ static void test_transient_allocator_embedding() {
 
 static void bench_transient_allocation() {
   TEST;
-  glr_allocator_t a1 = glr_get_transient_allocator(NULL);
+  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a1);
 
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
@@ -574,10 +572,9 @@ static void bench_transient_allocation() {
   }
   struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
-  int64_t elapsed = (end.tv_sec - start.tv_sec) * 1e9 +
-      (end.tv_nsec - start.tv_nsec);
-  printf("transient malloc: %d iterations took = %f secs\n",
-         n, elapsed / 1e9);
+  int64_t elapsed =
+      (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec);
+  printf("transient malloc: %d iterations took = %f secs\n", n, elapsed / 1e9);
 
   glr_pop_allocator();
   glr_destroy_allocator(&a1);
@@ -625,7 +622,7 @@ static void test_timers() {
   for (int i = 0; i < 10; ++i) {
     td[i].arr = execution_order;
     td[i].len = &len;
-    td[i].cap = sizeof(execution_order)/sizeof(execution_order[0]);
+    td[i].cap = sizeof(execution_order) / sizeof(execution_order[0]);
     td[i].idx = i;
     td[i].main_ctx = cur;
     timers[i].arg = td + i;
@@ -637,7 +634,8 @@ static void test_timers() {
   printf("launching timers\n");
   glr_scheduler_yield(0);
 
-#define CHECK(cond) if (!(cond)) abort();
+#define CHECK(cond) \
+  if (!(cond)) abort();
   CHECK(execution_order[0] == 9);
   CHECK(execution_order[1] == 8);
   CHECK(execution_order[2] == 0);
@@ -654,8 +652,8 @@ static void test_timers() {
 }
 
 static void allocator_use_coro(void *arg) {
-  (void) arg;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  (void)arg;
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
   glr_scheduler_yield(1);
 
@@ -682,9 +680,7 @@ typedef struct {
   glr_exec_context_t *ctx;
 } async_test_data;
 
-void test_async1_job_fn(void *arg) {
-  glr_scheduler_add(arg);
-}
+void test_async1_job_fn(void *arg) { glr_scheduler_add(arg); }
 
 void *test_async1_thread_fn(void *arg) {
   async_test_data *td = arg;
@@ -731,7 +727,6 @@ void *test_async2_thread_fn(void *arg) {
   return NULL;
 }
 
-
 static void test_async2(int n) {
   TEST;
 
@@ -747,7 +742,7 @@ static void test_async2(int n) {
     abort();
   }
   int64_t end = glr_timestamp_in_ms();
-  printf("Test for %d (%d) asyncs took %ld ms\n", td.n, td.called, end-begin);
+  printf("Test for %d (%d) asyncs took %ld ms\n", td.n, td.called, end - begin);
   if (td.n != td.called) {
     abort();
   }
@@ -766,7 +761,6 @@ void *test_async3_thread_fn(void *arg) {
   return NULL;
 }
 
-
 static void test_async3(int n) {
   TEST;
 
@@ -782,7 +776,7 @@ static void test_async3(int n) {
     abort();
   }
   int64_t end = glr_timestamp_in_ms();
-  printf("Test for %d (%d) asyncs took %ld ms\n", td.n, td.called, end-begin);
+  printf("Test for %d (%d) asyncs took %ld ms\n", td.n, td.called, end - begin);
   if (td.n != td.called) {
     abort();
   }
@@ -842,10 +836,11 @@ static void test_async5_job_fn(void *arg) {
   if (data->called > data->should_be_called) {
     abort();
   }
-//  if (test_async5_called % 10000 == 0) {
-//    printf("%s called %d times(exp=%ld cur=%ld)\n", __func__, test_async5_called,
-//           data->expected, *data->sum);
-//  }
+  //  if (test_async5_called % 10000 == 0) {
+  //    printf("%s called %d times(exp=%ld cur=%ld)\n", __func__,
+  //    test_async5_called,
+  //           data->expected, *data->sum);
+  //  }
 }
 
 typedef struct {
@@ -869,7 +864,7 @@ static void test_async5(int n) {
 
   int64_t sum = 0;
   int threads = 3;
-  int64_t expected_sum = threads * (0. + (double)(n-1)) / 2. * n;
+  int64_t expected_sum = threads * (0. + (double)(n - 1)) / 2. * n;
   glr_exec_context_t *main_ctx = glr_current_context();
   async_test5_job_data *job_data = GLR_ALLOCATE_ARRAY(async_test5_job_data, n);
   for (int i = 0; i < n; ++i) {
@@ -890,7 +885,8 @@ static void test_async5(int n) {
 
   int64_t begin = glr_timestamp_in_ms();
   for (int i = 0; i < threads; ++i) {
-    if (pthread_create(&thread_data[i].pthread, NULL, test_async5_thread_fn, thread_data + i)) {
+    if (pthread_create(&thread_data[i].pthread, NULL, test_async5_thread_fn,
+                       thread_data + i)) {
       abort();
     }
   }
@@ -902,10 +898,10 @@ static void test_async5(int n) {
   }
 
   int64_t end = glr_timestamp_in_ms();
-  printf("Test for %d asyncs from %d threads took %ld ms\n", n*threads, threads, end-begin);
+  printf("Test for %d asyncs from %d threads took %ld ms\n", n * threads,
+         threads, end - begin);
 
   glr_cur_thread_runtime_cleanup();
-
 }
 
 static void test_sleep() {
@@ -918,15 +914,15 @@ static void test_sleep() {
 
 static void test_address_resolving(const char *addr) {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
 
-  err_t e = {};
+  glr_error_t e = {};
   struct sockaddr_storage packed_address = glr_resolve_address2(addr, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s glr_resolve_address2 failed: %.*s",
-           __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s glr_resolve_address2 failed: %.*s", __FILE__, __LINE__,
+           __func__, msg.len, msg.data);
     abort();
   }
 
@@ -939,19 +935,21 @@ static void test_address_resolving(const char *addr) {
 
 static void test_address_not_resolving(const char *addr) {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
 
-  err_t e = {};
+  glr_error_t e = {};
   struct sockaddr_storage packed_address = glr_resolve_address2(addr, &e);
   if (e.error == GLR_GETADDRINFO_NO_RESULT_ERROR) {
   } else {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s glr_resolve_address2 failed: '%s' was resolved unexpectedly (%.*s)",
-           __FILE__, __LINE__, __func__, addr, msg.len, msg.data);
+    printf(
+        "%s:%d:%s glr_resolve_address2 failed: '%s' was resolved unexpectedly "
+        "(%.*s)",
+        __FILE__, __LINE__, __func__, addr, msg.len, msg.data);
     abort();
   }
-  (void) packed_address;
+  (void)packed_address;
 
   glr_destroy_allocator(&a);
   glr_cur_thread_runtime_cleanup();
@@ -959,28 +957,27 @@ static void test_address_not_resolving(const char *addr) {
 
 static void test_tcp_listening(const char *requested_addr) {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
-  struct sockaddr_storage packed_address
-      = glr_resolve_address2(requested_addr, &e);
+  struct sockaddr_storage packed_address =
+      glr_resolve_address2(requested_addr, &e);
 
   glr_fd_t *listener = glr_listen(&packed_address, 1000, 1, &e);
 
-  (void) listener;
+  (void)listener;
   struct sockaddr_storage res = glr_socket_local_address(listener, &e);
 
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
   str_t addr = glr_addr_to_string(&res);
-  printf("%s:%d:%s listening on %.*s (expected %s)\n",
-         __FILE__, __LINE__, __func__, addr.len, addr.data, requested_addr);
+  printf("%s:%d:%s listening on %.*s (expected %s)\n", __FILE__, __LINE__,
+         __func__, addr.len, addr.data, requested_addr);
 
   glr_close(listener);
 
@@ -990,29 +987,28 @@ static void test_tcp_listening(const char *requested_addr) {
 
 static void test_unix_listening(const char *requested_addr) {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
-  struct sockaddr_storage packed_address
-      = glr_resolve_unix_socket_addr(requested_addr);
+  struct sockaddr_storage packed_address =
+      glr_resolve_unix_socket_addr(requested_addr);
 
   unlink(requested_addr);
   glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
 
-  (void) listener;
+  (void)listener;
   struct sockaddr_storage res = glr_socket_local_address(listener, &e);
 
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s\n",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s\n", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
   str_t addr = glr_addr_to_string(&res);
-  printf("%s:%d:%s listening on %.*s (expected %s)\n",
-         __FILE__, __LINE__, __func__, addr.len, addr.data, requested_addr);
+  printf("%s:%d:%s listening on %.*s (expected %s)\n", __FILE__, __LINE__,
+         __func__, addr.len, addr.data, requested_addr);
 
   glr_close(listener);
 
@@ -1022,29 +1018,29 @@ static void test_unix_listening(const char *requested_addr) {
 
 static void test_fd_freelist_reuse(const char *unix_socket_addr) {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
-  struct sockaddr_storage packed_address
-      = glr_resolve_unix_socket_addr(unix_socket_addr);
+  struct sockaddr_storage packed_address =
+      glr_resolve_unix_socket_addr(unix_socket_addr);
   for (int i = 0; i < 5; ++i) {
     unlink(unix_socket_addr);
     glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
 
-    (void) listener;
+    (void)listener;
     struct sockaddr_storage res = glr_socket_local_address(listener, &e);
 
     if (e.error) {
       str_t msg = glr_stringbuilder_build(&e.msg);
-      printf("%s:%d:%s %.*s\n",
-          __FILE__, __LINE__, __func__, msg.len, msg.data);
+      printf("%s:%d:%s %.*s\n", __FILE__, __LINE__, __func__, msg.len,
+             msg.data);
       abort();
     }
 
     str_t addr = glr_addr_to_string(&res);
-    printf("%s:%d:%s listening on %.*s (expected %s)\n",
-           __FILE__, __LINE__, __func__, addr.len, addr.data, unix_socket_addr);
+    printf("%s:%d:%s listening on %.*s (expected %s)\n", __FILE__, __LINE__,
+           __func__, addr.len, addr.data, unix_socket_addr);
 
     glr_close(listener);
   }
@@ -1072,29 +1068,28 @@ void *test_accept_thread_fn(void *arg) {
 
 static void test_accept(const char *requested_addr) {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
-  struct sockaddr_storage packed_address
-      = glr_resolve_unix_socket_addr(requested_addr);
+  struct sockaddr_storage packed_address =
+      glr_resolve_unix_socket_addr(requested_addr);
 
   unlink(requested_addr);
   glr_fd_t *listener = glr_listen(&packed_address, 1000, 0, &e);
 
-  (void) listener;
+  (void)listener;
   struct sockaddr_storage res = glr_socket_local_address(listener, &e);
 
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s\n",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s\n", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
   str_t addr = glr_addr_to_string(&res);
-  printf("%s:%d:%s listening on %.*s (expected %s)\n",
-         __FILE__, __LINE__, __func__, addr.len, addr.data, requested_addr);
+  printf("%s:%d:%s listening on %.*s (expected %s)\n", __FILE__, __LINE__,
+         __func__, addr.len, addr.data, requested_addr);
 
   pthread_t connect_thread;
   if (pthread_create(&connect_thread, NULL, test_accept_thread_fn,
@@ -1102,19 +1097,18 @@ static void test_accept(const char *requested_addr) {
     abort();
   }
 
-  glr_accept_result_t accept_result
-      = glr_raw_accept(listener, &e);
+  glr_accept_result_t accept_result = glr_raw_accept(listener, &e);
 
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s accept failed: %.*s\n",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s accept failed: %.*s\n", __FILE__, __LINE__, __func__,
+           msg.len, msg.data);
     abort();
   }
 
   addr = glr_addr_to_string(&accept_result.address);
-  printf("%s:%d:%s accepted connection from %.*s\n",
-         __FILE__, __LINE__, __func__, addr.len, addr.data);
+  printf("%s:%d:%s accepted connection from %.*s\n", __FILE__, __LINE__,
+         __func__, addr.len, addr.data);
   pthread_join(connect_thread, NULL);
 
   glr_close(accept_result.con);
@@ -1131,10 +1125,10 @@ typedef struct {
 
 static void test_send_recv_coro_fn(void *arg) {
   test_send_recv_data_t *td = arg;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
 
-  err_t e = {};
+  glr_error_t e = {};
   glr_fd_t *conn = glr_raw_connect(td->addr, glr_timestamp_in_ms() + 1000, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
@@ -1155,9 +1149,9 @@ static void test_send_recv_coro_fn(void *arg) {
 
 static void test_send_recv() {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
       glr_resolve_address2("127.0.0.1:0", &e);
@@ -1194,9 +1188,9 @@ static void test_send_recv() {
 
 static void test_connect_timeout() {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
       glr_resolve_address2("www.google.com:444", &e);
@@ -1207,23 +1201,24 @@ static void test_connect_timeout() {
     abort();
   }
 
-  glr_fd_t *conn = glr_raw_connect(&packed_address, glr_timestamp_in_ms() + 100, &e);
+  glr_fd_t *conn =
+      glr_raw_connect(&packed_address, glr_timestamp_in_ms() + 100, &e);
   if (e.error != GLR_TIMEOUT_ERROR) {
     str_t msg = glr_stringbuilder_build(&e.msg);
     printf("%s:%d:%s %.*s\n", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
-  (void) conn;
+  (void)conn;
   glr_destroy_allocator(&a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_recv_timeout() {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
       glr_resolve_address2("127.0.0.1:0", &e);
@@ -1260,9 +1255,9 @@ static void test_recv_timeout() {
 
 static void test_send_timeout() {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
       glr_resolve_address2("127.0.0.1:0", &e);
@@ -1303,12 +1298,12 @@ static void test_send_timeout() {
 }
 
 static void test_ssl_connect(const char *domain, const char *port) {
-  printf("%s:%d:%s ssl connect %s:%s\n",
-         __FILE__, __LINE__, __func__, domain, port);
+  printf("%s:%d:%s ssl connect %s:%s\n", __FILE__, __LINE__, __func__, domain,
+         port);
 
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
       glr_resolve_address(domain, port, &e);
@@ -1347,7 +1342,7 @@ typedef struct {
 void *ssl_accept_test_connection_thread(void *arg) {
   ssl_accept_test_data_t *td = arg;
   SSL_CTX *ctx = glr_ssl_client_context();
-  //SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+  // SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
   BIO *bio = BIO_new_ssl_connect(ctx);
   if (!bio) abort();
@@ -1356,34 +1351,48 @@ void *ssl_accept_test_connection_thread(void *arg) {
   BIO_get_ssl(bio, &ssl);
 
   int rc = 0;
-  printf("%s:%d:%s connecting to %.*s:%.*s  \n",
-         __FILE__, __LINE__, __func__,
-         td->hostname.len, td->hostname.data,
-         td->port.len, td->port.data
-         );
+  printf("%s:%d:%s connecting to %.*s:%.*s  \n", __FILE__, __LINE__, __func__,
+         td->hostname.len, td->hostname.data, td->port.len, td->port.data);
 
   rc = BIO_set_conn_hostname(bio, td->hostname.data);
-  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+  if (rc != 1) {
+    ERR_print_errors_fp(stderr);
+    abort();
+  }
 
   rc = BIO_set_conn_port(bio, td->port.data);
-  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+  if (rc != 1) {
+    ERR_print_errors_fp(stderr);
+    abort();
+  }
 
   rc = SSL_set_tlsext_host_name(ssl, "test.localhost");
-  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+  if (rc != 1) {
+    ERR_print_errors_fp(stderr);
+    abort();
+  }
 
   rc = BIO_do_connect(bio);
-  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+  if (rc != 1) {
+    ERR_print_errors_fp(stderr);
+    abort();
+  }
 
   rc = BIO_do_handshake(bio);
-  if (rc != 1) { ERR_print_errors_fp(stderr); abort(); }
+  if (rc != 1) {
+    ERR_print_errors_fp(stderr);
+    abort();
+  }
 
   rc = BIO_puts(bio, "Hello");
-  if (rc <= 0) { ERR_print_errors_fp(stderr); abort(); }
+  if (rc <= 0) {
+    ERR_print_errors_fp(stderr);
+    abort();
+  }
 
   char buffer[256];
   int len = BIO_read(bio, buffer, 256);
-  printf("%s:%d:%s BIO_read returned %d \n",
-         __FILE__, __LINE__, __func__, len);
+  printf("%s:%d:%s BIO_read returned %d \n", __FILE__, __LINE__, __func__, len);
 
   BIO_free_all(bio);
 
@@ -1393,33 +1402,32 @@ void *ssl_accept_test_connection_thread(void *arg) {
 
 static void test_ssl_accept() {
   TEST;
-  glr_allocator_t a = glr_get_transient_allocator(NULL);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&a);
-  err_t e = {};
+  glr_error_t e = {};
   SSL_CTX *ctx = glr_ssl_server_context();
-  glr_ssl_ctx_set_key(ctx, "./certs/key.pem", /*password*/NULL, &e);
+  glr_ssl_ctx_set_key(ctx, "./certs/key.pem", /*password*/ NULL, &e);
   glr_ssl_ctx_set_cert(ctx, "./certs/cert.pem", &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
-  struct sockaddr_storage packed_address
-      = glr_resolve_address2("0.0.0.0:0", &e);
+  struct sockaddr_storage packed_address =
+      glr_resolve_address2("0.0.0.0:0", &e);
 
   glr_fd_t *listener = glr_listen(&packed_address, 1000, 1, &e);
 
   struct sockaddr_storage res = glr_socket_local_address(listener, &e);
 
   str_t addr = glr_addr_to_string(&res);
-  printf("%s:%d:%s listening on %.*s\n",
-         __FILE__, __LINE__, __func__, addr.len, addr.data);
+  printf("%s:%d:%s listening on %.*s\n", __FILE__, __LINE__, __func__, addr.len,
+         addr.data);
 
   ssl_accept_test_data_t td = {
-    GLR_STR_LITERAL("127.0.0.1"),
-    glr_sprintf("%d", glr_addr_get_port(&res)),
+      GLR_STR_LITERAL("127.0.0.1"),
+      glr_sprintf("%d", glr_addr_get_port(&res)),
   };
   pthread_t client_thread;
   if (pthread_create(&client_thread, NULL, ssl_accept_test_connection_thread,
@@ -1434,8 +1442,7 @@ static void test_ssl_accept() {
 
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
@@ -1449,13 +1456,12 @@ static void test_ssl_accept() {
 static void test_convenient_connect() {
   TEST;
   glr_fd_t *conn = NULL;
-  err_t e = {};
+  glr_error_t e = {};
 
   conn = glr_tcp_dial_addr("google.com:80", 0, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
   glr_close(conn);
@@ -1463,8 +1469,7 @@ static void test_convenient_connect() {
   conn = glr_tcp_dial_addr_ssl("google.com:443", 0, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
   glr_close(conn);
@@ -1472,8 +1477,7 @@ static void test_convenient_connect() {
   conn = glr_tcp_dial_hostname_port("google.com", "80", 0, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
   glr_close(conn);
@@ -1481,8 +1485,7 @@ static void test_convenient_connect() {
   conn = glr_tcp_dial_hostname_port_ssl("google.com", "443", 0, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
   glr_close(conn);
@@ -1490,8 +1493,7 @@ static void test_convenient_connect() {
   conn = glr_tcp_dial_hostname_port2("google.com", 80, 0, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
   glr_close(conn);
@@ -1499,8 +1501,7 @@ static void test_convenient_connect() {
   conn = glr_tcp_dial_hostname_port_ssl2("google.com", 443, 0, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
   glr_close(conn);
@@ -1516,7 +1517,7 @@ static void test_fd_conn_functions() {
   char recv_buffer[256] = {};
   int received = 0;
   glr_fd_t *conn = NULL;
-  err_t e = {};
+  glr_error_t e = {};
 
   conn = glr_tcp_dial_addr("google.com:80", 0, &e);
   glr_fd_conn_send_exactly(conn, payload.data, payload.len, &e);
@@ -1526,13 +1527,12 @@ static void test_fd_conn_functions() {
 
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
-  printf("%s:%d:%s RECEIVED from 80 port %d bytes: %.*s\n",
-      __FILE__, __LINE__, __func__, received, received, recv_buffer);
+  printf("%s:%d:%s RECEIVED from 80 port %d bytes: %.*s\n", __FILE__, __LINE__,
+         __func__, received, received, recv_buffer);
 
   conn = glr_tcp_dial_addr_ssl("google.com:443", 0, &e);
   glr_fd_conn_send_exactly(conn, payload.data, payload.len, &e);
@@ -1542,13 +1542,12 @@ static void test_fd_conn_functions() {
 
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
-  printf("%s:%d:%s RECEIVED from 443 ssl port %d bytes: %.*s\n",
-      __FILE__, __LINE__, __func__, received, received, recv_buffer);
+  printf("%s:%d:%s RECEIVED from 443 ssl port %d bytes: %.*s\n", __FILE__,
+         __LINE__, __func__, received, received, recv_buffer);
 
   glr_cur_thread_runtime_cleanup();
 }
@@ -1560,13 +1559,13 @@ typedef struct {
 
 size_t curl_perform_write_cb(void *contents, size_t size, size_t nmemb,
                              void *userp) {
-  (void) userp;
+  (void)userp;
   size_t realsize = size * nmemb;
   curl_perform_test_data_t *td = userp;
   glr_push_allocator(&td->a);
   glr_stringbuilder_append(&td->sb, contents, realsize);
   glr_pop_allocator();
-  //printf("received %lu bytes, total=%lu\n", realsize, response_body->size());
+  // printf("received %lu bytes, total=%lu\n", realsize, response_body->size());
   return realsize;
 }
 
@@ -1582,7 +1581,7 @@ static void curl_perform_test(const char *url, ssize_t expected_size) {
   CURLcode res = CURLE_OK;
 
   curl_perform_test_data_t td = {};
-  td.a = glr_get_transient_allocator(NULL);
+  td.a = glr_create_transient_allocator(NULL);
   glr_push_allocator(&td.a);
   td.sb = glr_make_stringbuilder(4096);
 
@@ -1590,14 +1589,13 @@ static void curl_perform_test(const char *url, ssize_t expected_size) {
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_perform_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &td);
   curl_easy_setopt(curl, CURLOPT_PRIVATE, url);
-  //curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-  //curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, my_trace);
-  err_t e = {};
+  // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+  // curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, my_trace);
+  glr_error_t e = {};
   res = glr_curl_perform(curl, &e);
   if (e.error) {
     str_t msg = glr_stringbuilder_build(&e.msg);
-    printf("%s:%d:%s %.*s",
-        __FILE__, __LINE__, __func__, msg.len, msg.data);
+    printf("%s:%d:%s %.*s", __FILE__, __LINE__, __func__, msg.len, msg.data);
     abort();
   }
 
@@ -1621,8 +1619,8 @@ static void curl_perform_test(const char *url, ssize_t expected_size) {
     abort();
   }
 
-  printf("%s:%d:%s %s response is %u bytes long\n",
-         __FILE__, __LINE__, __func__, url, response.len);
+  printf("%s:%d:%s %s response is %u bytes long\n", __FILE__, __LINE__,
+         __func__, url, response.len);
 
   if (expected_size >= 0 && response.len != (size_t)expected_size) {
     abort();
@@ -1636,9 +1634,113 @@ static void curl_perform_test(const char *url, ssize_t expected_size) {
   printf("%s:%d:%s %s DONE\n", __FILE__, __LINE__, __func__, url);
 }
 
+static void test_loggers() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
+  glr_push_allocator(&a);
+
+  glr_error_t e = {};
+
+  // test default sinks
+  struct glr_logger_t *stdout_logger = glr_get_stdout_logger();
+  if (stdout_logger == NULL) {
+    abort();
+  }
+
+  struct glr_logger_t *stdout_logger2 = glr_get_stdout_logger();
+  if (stdout_logger != stdout_logger2) {
+    abort();
+  }
+
+  struct glr_logger_t *stderr_logger = glr_get_stderr_logger();
+  if (stderr_logger == NULL) {
+    abort();
+  }
+
+  struct glr_logger_t *stderr_logger2 = glr_get_stderr_logger();
+  if (stderr_logger != stderr_logger2) {
+    abort();
+  }
+
+  struct glr_logger_t *no_logger = glr_logger_create("/etc/forbidden.123", &e);
+  if (no_logger) {
+    abort();
+  }
+
+  if (e.error == 0) {
+    abort();
+  }
+  str_t msg = glr_stringbuilder_build(&e.msg);
+  printf("%s:%d:%s Expected error %.*s\n", __FILE__, __LINE__, __func__, msg.len,
+         msg.data);
+
+  glr_err_cleanup(&e);
+  const char *path = "/tmp/glr.log";
+  unlink(path);
+  struct glr_logger_t *file_logger = glr_logger_create(path, &e);
+  if (file_logger == NULL) {
+    abort();
+  }
+  if (e.error) {
+    printf("%s:%d:%s Unexpected error %.*s\n", __FILE__, __LINE__, __func__,
+           msg.len, msg.data);
+    abort();
+  }
+
+
+  //
+  glr_log2(file_logger, GLR_LOG_LEVEL_TRACE, "It really works %d", 123);
+  glr_log2(file_logger, GLR_LOG_LEVEL_DEBUG, "It really works %d", 234);
+  glr_log2(file_logger, GLR_LOG_LEVEL_INFO, "It really works %d", 345);
+  glr_log2(file_logger, GLR_LOG_LEVEL_WARNING, "It really works %d", 456);
+  glr_log2(file_logger, GLR_LOG_LEVEL_ERROR, "It really works %d", 567);
+  glr_log2(file_logger, GLR_LOG_LEVEL_CRITICAL, "It really works %d", 678);
+
+  if (glr_get_default_logger() != stderr_logger) {
+    abort();
+  }
+  glr_set_default_logger(stdout_logger);
+  if (glr_get_default_logger() != stdout_logger) {
+    abort();
+  }
+
+  if (glr_get_logger() != stdout_logger) {
+    abort();
+  }
+
+  glr_set_logger(file_logger);
+  if (glr_get_logger() != file_logger) {
+    abort();
+  }
+
+  glr_log(GLR_LOG_LEVEL_CRITICAL, "Logger from context works");
+  glr_log_error("Convenient logging also works");
+
+  glr_set_min_log_level(file_logger, GLR_LOG_LEVEL_DEBUG);
+  glr_log_trace("these message SHOULD NOT be outputted");
+
+  glr_set_logger(NULL);
+  glr_logger_destroy(file_logger);
+
+  glr_pop_allocator();
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
+static void test_loggers_flush() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+
+  struct glr_logger_t *stderr_logger = glr_get_stderr_logger();
+  glr_log2(stderr_logger, GLR_LOG_LEVEL_TRACE, "These should be printed %d!!!", 123);
+
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
 int main() {
-  int async_tests_enabled = 0;
-  int dns_tests_enabled = 0;
+  int async_tests_enabled = 1;
+  int dns_tests_enabled = 1;
+  int curl_tests_enabled = 1;
 
   label_pointers();
   error_handling();
@@ -1710,10 +1812,16 @@ int main() {
   test_convenient_connect();
   test_fd_conn_functions();
 
-  curl_perform_test("http://example.com", -1);
-  curl_perform_test("https://example.com", -1);
-  curl_perform_test("https://httpbin.org/bytes/10000", 10000);
-  curl_perform_test("https://httpbin.org/bytes/100000", 100000);
-  curl_perform_test("https://www.google.com", -1);
+  if (curl_tests_enabled) {
+    curl_perform_test("http://example.com", -1);
+    curl_perform_test("https://example.com", -1);
+    curl_perform_test("https://httpbin.org/bytes/10000", 10000);
+    curl_perform_test("https://httpbin.org/bytes/100000", 100000);
+    curl_perform_test("https://www.google.com", -1);
+  }
 
+  test_loggers();
+
+  //these test should be last
+  test_loggers_flush();
 }

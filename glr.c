@@ -1,6 +1,8 @@
 #include "glr.h"
 
 #include <malloc.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdalign.h>
@@ -11,7 +13,9 @@
 #include <sys/time.h>
 #include <sys/eventfd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -53,6 +57,7 @@ struct glr_exec_context_t {
   void **sp;
   glr_exec_stack_t *stack;
   glr_allocator_t *saved_allocator;
+  glr_logger_t *logger;
 };
 
 typedef struct {
@@ -137,10 +142,12 @@ void *glr_malloc_free_adapter(void *data, int op, size_t size, size_t alignment,
   return NULL;
 }
 
-glr_allocator_t glr_get_default_allocator() {
-  glr_allocator_t result = {};
-  result.func = glr_malloc_free_adapter;
-  return result;
+static glr_allocator_t glr_default_allocator = {
+  .data = NULL, .func = glr_malloc_free_adapter, .next = NULL
+};
+
+glr_allocator_t* glr_get_default_allocator() {
+  return &glr_default_allocator;
 }
 
 // Transient allocator: alloc many times and clean it once in the end
@@ -264,7 +271,7 @@ void *glr_transient_allocator_func(
   return NULL;
 }
 
-glr_allocator_t glr_get_transient_allocator(glr_allocator_t *parent) {
+glr_allocator_t glr_create_transient_allocator(glr_allocator_t *parent) {
   if (!parent) {
     parent = glr_current_allocator();
   }
@@ -315,7 +322,7 @@ glr_allocator_t* glr_pop_allocator() {
 glr_allocator_t* glr_current_allocator() {
   if (!glr_runtime.current_allocator) {
     if (!glr_runtime.cached_default_allocator.func) {
-      glr_runtime.cached_default_allocator = glr_get_default_allocator();
+      glr_runtime.cached_default_allocator = *glr_get_default_allocator();
     }
     glr_runtime.current_allocator = &glr_runtime.cached_default_allocator;
   }
@@ -668,6 +675,7 @@ glr_exec_context_t *glr_get_context_from_freelist() {
       glr_runtime.free_contexts[glr_runtime.free_contexts_len - 1];
   glr_runtime.free_contexts_len--;
   result->saved_allocator = NULL;
+  result->logger = NULL;
   return result;
 }
 
@@ -841,14 +849,14 @@ void glr_scheduler_yield(int reschedule_current_ctx) {
   glr_transfer(cur_ctx, next_ctx);
 }
 //error handling
-inline void glr_err_cleanup(err_t *err) {
+inline void glr_err_cleanup(glr_error_t *err) {
   glr_stringbuilder_free_buffers(&err->msg);
-  *err = (err_t) {};
+  *err = (glr_error_t) {};
 }
 
 const char *glr_posix_error = "GLR_POSIX_ERROR";
 
-void glr_make_posix_error(err_t *err, const char *file, int line,
+void glr_make_posix_error(glr_error_t *err, const char *file, int line,
                           const char *func, const char *format, ...) {
   int saved_errno = errno;
   err->error = GLR_POSIX_ERROR;
@@ -962,7 +970,7 @@ static void glr_init_event_loop() {
   }
   glr_runtime.async_eventfd_poll.cb = glr_async_consume;
 
-  err_t err = {};
+  glr_error_t err = {};
   glr_add_poll(&glr_runtime.async_eventfd_poll, EPOLLET|EPOLLIN, &err);
   if (err.error) {
     perror("Failed to poll eventfd instance of async tasks: ");
@@ -979,7 +987,7 @@ static inline uint32_t glr_runtime_get_epoll_fd() {
   return glr_runtime.epoll_fd;
 }
 
-void glr_add_poll(glr_poll_t *poll, int flags, err_t *err) {
+void glr_add_poll(glr_poll_t *poll, int flags, glr_error_t *err) {
   if (err->error) {
     return;
   }
@@ -995,7 +1003,7 @@ void glr_add_poll(glr_poll_t *poll, int flags, err_t *err) {
   }
 }
 
-void glr_change_poll(glr_poll_t *poll, int flags, err_t *err) {
+void glr_change_poll(glr_poll_t *poll, int flags, glr_error_t *err) {
   if (err->error) {
     return;
   }
@@ -1011,7 +1019,7 @@ void glr_change_poll(glr_poll_t *poll, int flags, err_t *err) {
   }
 }
 
-void glr_remove_poll(glr_poll_t *poll, err_t *err) {
+void glr_remove_poll(glr_poll_t *poll, glr_error_t *err) {
   if (err->error) {
     return;
   }
@@ -1029,7 +1037,7 @@ void glr_add_context_poll_callback(glr_poll_t *p) {
   glr_scheduler_add((glr_exec_context_t *) p->cb_arg);
 }
 
-int glr_wait_for(int fd, uint32_t flags, err_t *err) {
+int glr_wait_for(int fd, uint32_t flags, glr_error_t *err) {
   if (err->error) {
     return 0;
   }
@@ -1212,7 +1220,7 @@ static void glr_async_consume(glr_poll_t *p) {
 }
 
 struct sockaddr_storage glr_resolve_address(const char *host, const char *port,
-                                            err_t *err) {
+                                            glr_error_t *err) {
   if (err->error) return (struct sockaddr_storage){};
 
   struct sockaddr_storage addr = {};
@@ -1245,14 +1253,14 @@ cleanup:
 }
 
 struct sockaddr_storage glr_resolve_address1(const char *host, int port,
-                                             err_t *err) {
+                                             glr_error_t *err) {
   char port_buffer[10];
   snprintf(port_buffer, 10, "%d", port);
   return glr_resolve_address(host, port_buffer, err);
 }
 
 
-struct sockaddr_storage glr_resolve_address2(const char *addr, err_t *err) {
+struct sockaddr_storage glr_resolve_address2(const char *addr, glr_error_t *err) {
   if (err->error) return (struct sockaddr_storage){};
 
   const char *host_begin = addr;
@@ -1368,7 +1376,7 @@ static void glr_fd_poll_callback(glr_poll_t *poll) {
   }
 }
 
-glr_fd_t *glr_init_fd(int fd, err_t *err) {
+glr_fd_t *glr_init_fd(int fd, glr_error_t *err) {
   if (err->error) return NULL;
 
   glr_runtime_t *r = &glr_runtime;
@@ -1404,7 +1412,7 @@ error_cleanup:
 }
 
 glr_fd_t *glr_listen(const struct sockaddr_storage *addr, int backlog,
-                     int reuse_addr, err_t *err) {
+                     int reuse_addr, glr_error_t *err) {
   if (err->error) return NULL;
 
   int fd = -1;
@@ -1459,7 +1467,7 @@ cleanup_after_error:
   return NULL;
 }
 
-struct sockaddr_storage glr_socket_local_address(glr_fd_t *fd, err_t *err) {
+struct sockaddr_storage glr_socket_local_address(glr_fd_t *fd, glr_error_t *err) {
   if (err->error) return (struct sockaddr_storage){};
 
   struct sockaddr_storage result = {};
@@ -1484,7 +1492,7 @@ void glr_fd_wait_timer_cb(glr_timer_t *t) {
   glr_scheduler_add(timer_state->ctx);
 }
 
-void glr_fd_wait_until(glr_fd_t *fd, int state, int64_t deadline, err_t *err) {
+void glr_fd_wait_until(glr_fd_t *fd, int state, int64_t deadline, glr_error_t *err) {
   if (err->error) return;
 
   glr_exec_context_t *cur_ctx = glr_current_context();
@@ -1550,7 +1558,7 @@ int glr_fd_get_native(glr_fd_t *fd) {
   return fd->poll.fd;
 }
 
-glr_accept_result_t glr_raw_accept(glr_fd_t *listener, err_t *err) {
+glr_accept_result_t glr_raw_accept(glr_fd_t *listener, glr_error_t *err) {
   glr_accept_result_t result = {};
   if (err->error) return result;
 
@@ -1595,7 +1603,7 @@ glr_accept_result_t glr_raw_accept(glr_fd_t *listener, err_t *err) {
   }
 }
 
-glr_fd_t *glr_raw_connect(const struct sockaddr_storage *addr, int64_t deadline, err_t *err) {
+glr_fd_t *glr_raw_connect(const struct sockaddr_storage *addr, int64_t deadline, glr_error_t *err) {
   if (err->error) return NULL;
   int fd = socket(addr->ss_family, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
   if (fd < 0) {
@@ -1654,7 +1662,7 @@ void glr_fd_set_deadline(glr_fd_t *fd, int64_t deadline) {
   fd->deadline = deadline;
 }
 
-int glr_fd_raw_send(glr_fd_t *fd, const char *data, int len, err_t *err) {
+int glr_fd_raw_send(glr_fd_t *fd, const char *data, int len, glr_error_t *err) {
   if (err->error) return -1;
   for (;;) {
     int result = send(glr_fd_get_native(fd), data, len, MSG_NOSIGNAL);
@@ -1675,7 +1683,7 @@ int glr_fd_raw_send(glr_fd_t *fd, const char *data, int len, err_t *err) {
 }
 
 
-int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, err_t *err) {
+int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, glr_error_t *err) {
   if (err->error) return -1;
   for (;;) {
     int result = recv(glr_fd_get_native(fd), data, len, MSG_NOSIGNAL);
@@ -1695,7 +1703,7 @@ int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, err_t *err) {
   }
 }
 
-void glr_fd_raw_shutdown(glr_fd_t *fd, err_t *err) {
+void glr_fd_raw_shutdown(glr_fd_t *fd, glr_error_t *err) {
   if (err->error) return;
   int result = shutdown(glr_fd_get_native(fd), SHUT_RDWR);
   if (result == -1) {
@@ -1749,7 +1757,7 @@ static int glr_ssl_password_cb(char *buf, int size, int rwflag,
 }
 
 void glr_ssl_ctx_set_key(SSL_CTX *ctx, const char *path,
-                             const char *password, err_t *error) {
+                             const char *password, glr_error_t *error) {
   if (error->error) return;
 
   if (!SSL_CTX_use_PrivateKey_file(ctx, path, SSL_FILETYPE_PEM)) {
@@ -1767,7 +1775,7 @@ void glr_ssl_ctx_set_key(SSL_CTX *ctx, const char *path,
   }
 }
 
-void glr_ssl_ctx_set_cert(SSL_CTX *ctx, const char *path, err_t *error) {
+void glr_ssl_ctx_set_cert(SSL_CTX *ctx, const char *path, glr_error_t *error) {
   if (error->error) return;
 
   if (!SSL_CTX_use_certificate_chain_file(ctx, path)) {
@@ -1787,7 +1795,7 @@ static int glr_ssl_bio_init(BIO *bio) {
 
 static int glr_ssl_bio_write(BIO *bio, const char *data, int len) {
   glr_fd_t *conn = BIO_get_data(bio);
-  err_t err = {};
+  glr_error_t err = {};
   int n = glr_fd_raw_send(conn, data, len, &err);
   if (err.error) {
     glr_err_cleanup(&err);
@@ -1799,7 +1807,7 @@ static int glr_ssl_bio_write(BIO *bio, const char *data, int len) {
 
 static int glr_ssl_bio_read(BIO *bio, char *data, int len) {
   glr_fd_t *conn = BIO_get_data(bio);
-  err_t err = {};
+  glr_error_t err = {};
   int n = glr_fd_raw_recv(conn, data, len, &err);
   if (err.error) {
     glr_err_cleanup(&err);
@@ -1851,7 +1859,7 @@ static str_t glr_ssl_get_error_msg() {
 
 void glr_ssl_client_conn_handshake(SSL_CTX *ctx, glr_fd_t *conn,
                                    const char *hostname, int64_t deadline,
-                                   err_t *err) {
+                                   glr_error_t *err) {
   if (err->error) return;
   SSL *ssl = SSL_new(ctx);
   BIO *bio = BIO_new(glr_ssl_get_bio_method());
@@ -1875,7 +1883,7 @@ void glr_ssl_client_conn_handshake(SSL_CTX *ctx, glr_fd_t *conn,
 }
 
 void glr_ssl_server_conn_upgrade(SSL_CTX *ctx, glr_fd_t *conn, int64_t deadline,
-                     err_t *err) {
+                     glr_error_t *err) {
   glr_fd_set_deadline(conn, deadline);
 
   SSL *ssl = SSL_new(ctx);
@@ -1896,7 +1904,7 @@ void glr_ssl_server_conn_upgrade(SSL_CTX *ctx, glr_fd_t *conn, int64_t deadline,
   }
 }
 
-int glr_ssl_read(glr_fd_t *impl, char *buffer, size_t len, err_t *err) {
+int glr_ssl_read(glr_fd_t *impl, char *buffer, size_t len, glr_error_t *err) {
   if (err->error) return 0;
 
   SSL *ssl = impl->ssl;
@@ -1921,7 +1929,7 @@ int glr_ssl_read(glr_fd_t *impl, char *buffer, size_t len, err_t *err) {
   return n;
 }
 
-int glr_ssl_write(glr_fd_t *impl, const char *buffer, size_t len, err_t *err) {
+int glr_ssl_write(glr_fd_t *impl, const char *buffer, size_t len, glr_error_t *err) {
   SSL *ssl = impl->ssl;
   int n = SSL_write(ssl, buffer, len);
   if (glr_unlikely(n <= 0)) {
@@ -1965,7 +1973,7 @@ SSL_CTX *glr_get_default_client_ssl_ctx() {
 
 //Network connection convenience
 glr_fd_t *glr_tcp_dial_hostname_port_ex(const char *host, const char *port,
-                                        int ssl, int64_t deadline, err_t *err) {
+                                        int ssl, int64_t deadline, glr_error_t *err) {
   if (err->error) return NULL;
   //FIXME: may block indefinetely in case of network issues
   struct sockaddr_storage sockaddr = glr_resolve_address(host, port, err);
@@ -1999,7 +2007,7 @@ glr_fd_t *glr_tcp_dial_hostname_port_ex(const char *host, const char *port,
   return conn;
 }
 
-glr_fd_t *glr_tcp_dial_addr(const char *addr, int64_t deadline, err_t *err) {
+glr_fd_t *glr_tcp_dial_addr(const char *addr, int64_t deadline, glr_error_t *err) {
   if (err->error) return NULL;
 
   const char *host_begin = addr;
@@ -2038,19 +2046,19 @@ glr_fd_t *glr_tcp_dial_addr(const char *addr, int64_t deadline, err_t *err) {
 }
 
 glr_fd_t *glr_tcp_dial_hostname_port(const char *hostname, const char *port,
-                                     int64_t deadline, err_t *err) {
+                                     int64_t deadline, glr_error_t *err) {
   return glr_tcp_dial_hostname_port_ex(hostname, port, 0, deadline, err);
 }
 
 glr_fd_t *glr_tcp_dial_hostname_port2(const char *hostname, uint16_t port,
-                                      int64_t deadline, err_t *err) {
+                                      int64_t deadline, glr_error_t *err) {
   char port_buffer[7] = {0};
   snprintf(port_buffer, sizeof(port_buffer), "%d", port);
   return glr_tcp_dial_hostname_port_ex(hostname, port_buffer, 0, deadline, err);
 }
 
 #ifdef GLR_SSL
-glr_fd_t *glr_tcp_dial_addr_ssl(const char *addr, int64_t deadline, err_t *err) {
+glr_fd_t *glr_tcp_dial_addr_ssl(const char *addr, int64_t deadline, glr_error_t *err) {
   const char *host_begin = addr;
   const char *last_colon = NULL;
   const char *it = addr;
@@ -2087,13 +2095,13 @@ glr_fd_t *glr_tcp_dial_addr_ssl(const char *addr, int64_t deadline, err_t *err) 
 }
 
 glr_fd_t *glr_tcp_dial_hostname_port_ssl(const char *hostname, const char *port,
-                                         int64_t deadline, err_t *err) {
+                                         int64_t deadline, glr_error_t *err) {
 
   return glr_tcp_dial_hostname_port_ex(hostname, port, 1, deadline, err);
 }
 
 glr_fd_t *glr_tcp_dial_hostname_port_ssl2(const char *hostname, uint16_t port,
-                                          int64_t deadline, err_t *err) {
+                                          int64_t deadline, glr_error_t *err) {
   char port_buffer[7] = {0};
   snprintf(port_buffer, sizeof(port_buffer), "%d", port);
   return glr_tcp_dial_hostname_port_ex(hostname, port_buffer, 1, deadline, err);
@@ -2101,7 +2109,7 @@ glr_fd_t *glr_tcp_dial_hostname_port_ssl2(const char *hostname, uint16_t port,
 
 #endif
 
-int glr_fd_conn_send(glr_fd_t *conn, const char *data, size_t len, err_t *err) {
+int glr_fd_conn_send(glr_fd_t *conn, const char *data, size_t len, glr_error_t *err) {
   if (err->error) return -1;
 #ifdef GLR_SSL
   if (conn->ssl) return glr_ssl_write(conn, data, len, err);
@@ -2109,7 +2117,7 @@ int glr_fd_conn_send(glr_fd_t *conn, const char *data, size_t len, err_t *err) {
   return glr_fd_raw_send(conn, data, len, err);
 }
 
-int glr_fd_conn_recv(glr_fd_t *conn, char *data, size_t len, err_t *err) {
+int glr_fd_conn_recv(glr_fd_t *conn, char *data, size_t len, glr_error_t *err) {
   if (err->error) return -1;
 #ifdef GLR_SSL
   if (conn->ssl) return glr_ssl_read(conn, data, len, err);
@@ -2117,7 +2125,7 @@ int glr_fd_conn_recv(glr_fd_t *conn, char *data, size_t len, err_t *err) {
   return glr_fd_raw_recv(conn, data, len, err);
 }
 
-void glr_fd_conn_shutdown(glr_fd_t *conn, err_t *err) {
+void glr_fd_conn_shutdown(glr_fd_t *conn, glr_error_t *err) {
   if (err->error) return;
 #ifdef GLR_SSL
   if (conn->ssl) return glr_ssl_shutdown(conn);
@@ -2125,7 +2133,7 @@ void glr_fd_conn_shutdown(glr_fd_t *conn, err_t *err) {
   return glr_fd_raw_shutdown(conn, err);
 }
 
-int glr_fd_conn_send_exactly(glr_fd_t *conn, const char *data, size_t len, err_t *err) {
+int glr_fd_conn_send_exactly(glr_fd_t *conn, const char *data, size_t len, glr_error_t *err) {
   size_t sent = 0;
   while (sent < len) {
     int n = glr_fd_conn_send(conn, data + sent, len - sent, err);
@@ -2135,7 +2143,7 @@ int glr_fd_conn_send_exactly(glr_fd_t *conn, const char *data, size_t len, err_t
   return sent;
 }
 
-int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, err_t *err) {
+int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, glr_error_t *err) {
   size_t have_read = 0;
   while (have_read < len) {
     int n = glr_fd_conn_recv(conn, data + have_read, len - have_read, err);
@@ -2145,13 +2153,281 @@ int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, err_t *err)
   return have_read;
 }
 
+//Logging
+void glr_logger_flush(glr_logger_t *logger);
+
+struct glr_logger_t {
+  int fd;
+  int own;
+  pthread_mutex_t mtx;
+  glr_log_level_t min_level;
+  uint16_t buffer_used;
+  char buffer[4096];
+};
+
+void glr_log_start_flusher_thread();
+void glr_log_stop_flusher_thread();
+
+static glr_logger_t glr_stdout_logger = {
+  .fd = STDIN_FILENO, .own = 0, .mtx = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static glr_logger_t glr_stderr_logger = {
+  .fd = STDERR_FILENO, .own = 0, .mtx = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static glr_logger_t *glr_default_logger = &glr_stderr_logger;
+glr_logger_t *glr_get_default_logger() {
+  return glr_default_logger;
+}
+
+void glr_set_default_logger(glr_logger_t *logger) {
+  glr_default_logger = logger;
+}
+
+glr_logger_t *glr_get_logger() {
+  glr_exec_context_t *ctx = glr_current_context();
+  if (ctx->logger) return ctx->logger;
+  return glr_get_default_logger();
+}
+
+void glr_set_logger(glr_logger_t *logger) {
+  glr_exec_context_t *ctx = glr_current_context();
+  ctx->logger = logger;
+}
+
+void glr_set_min_log_level(glr_logger_t *logger, glr_log_level_t level) {
+  logger->min_level = level;
+}
+
+glr_logger_t *glr_get_stdout_logger() {
+  return &glr_stdout_logger;
+}
+
+glr_logger_t *glr_get_stderr_logger() {
+  return &glr_stderr_logger;
+}
+
+static glr_logger_t *glr_log_flusher_thread_list[128] = {
+  &glr_stdout_logger, &glr_stderr_logger,
+};
+static int glr_log_flusher_thread_list_len = 2;
+static pthread_mutex_t glr_log_flusher_list_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_t glr_log_flusher_thread;
+static pthread_once_t glr_log_flusher_thread_is_iniitialized = PTHREAD_ONCE_INIT;
+static pthread_once_t glr_log_atexit_is_iniitialized = PTHREAD_ONCE_INIT;
+static atomic_int glr_log_flusher_thread_should_stop;
+
+struct glr_logger_t *glr_logger_create(const char *filename, glr_error_t *e) {
+  if (e->error) return NULL;
+
+  int permissions = 0600;
+  int fd = open(filename, O_WRONLY|O_APPEND|O_CREAT, permissions);
+  if (fd < 0) {
+    GLR_MAKE_POSIX_ERROR(
+        e, ": open (%s) O_APPEND|O_CREATE with permissions(%o) failed",
+        filename, permissions);
+    return NULL;
+  }
+
+  struct glr_logger_t *result = GLR_ALLOCATE_TYPE(struct glr_logger_t);
+  result->fd = fd;
+  result->own = 1;
+  result->buffer_used = 0;
+  result->min_level = GLR_LOG_LEVEL_TRACE;
+  pthread_mutex_init(&result->mtx, NULL);
+
+  glr_log_start_flusher_thread();
+
+  pthread_mutex_lock(&glr_log_flusher_list_mtx);
+  glr_log_flusher_thread_list[glr_log_flusher_thread_list_len++] = result;
+  pthread_mutex_unlock(&glr_log_flusher_list_mtx);
+
+  return result;
+}
+
+void glr_logger_destroy(struct glr_logger_t *logger) {
+  glr_logger_flush(logger);
+
+  pthread_mutex_lock(&glr_log_flusher_list_mtx);
+  for (int i = 0; i < glr_log_flusher_thread_list_len; ++i) {
+    if (glr_log_flusher_thread_list[i] == logger) {
+      glr_log_flusher_thread_list[i]
+        = glr_log_flusher_thread_list[--glr_log_flusher_thread_list_len];
+      break;
+    }
+  }
+  pthread_mutex_unlock(&glr_log_flusher_list_mtx);
+
+  pthread_mutex_destroy(&logger->mtx);
+  glr_free(logger);
+}
+
+str_t glr_log_level_trace_str   = GLR_STR_LITERAL("[trace]");
+str_t glr_log_level_debug_str   = GLR_STR_LITERAL("[debug]");
+str_t glr_log_level_info_str    = GLR_STR_LITERAL("[info] ");
+str_t glr_log_level_warning_str = GLR_STR_LITERAL("[warn] ");
+str_t glr_log_level_error_str   = GLR_STR_LITERAL("[error]");
+str_t glr_log_level_crit_str    = GLR_STR_LITERAL("[crit] ");
+
+static void glr_safe_write(int fd, const char *data, int len) {
+  // for file FD and less than 4096 bytes of data writes should be atomic, but
+  // if write was interrupted by a signal there are cases ...
+  // See NOTES https://linux.die.net/man/2/write
+  int written = 0;
+  int n = 0;
+  while (written < len) {
+    n = write(fd, data + written, len - written);
+    printf("called write(..) = %d\n", n);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      } else {
+        //Our logging system failed, totally unexpected error happened
+        //TODO: decide what to do here
+        perror(strerror(errno));
+        abort();
+      }
+    }
+    written += n;
+  }
+}
+
+void glr_logger_flush(glr_logger_t *logger) {
+  glr_safe_write(logger->fd, logger->buffer, logger->buffer_used);
+  fdatasync(logger->fd);
+  logger->buffer_used = 0;
+}
+
+void glr_flush_logs() {
+  pthread_mutex_lock(&glr_log_flusher_list_mtx);
+  for (int i = 0; i < glr_log_flusher_thread_list_len; ++i) {
+    glr_logger_t *logger = glr_log_flusher_thread_list[i];
+    pthread_mutex_lock(&logger->mtx);
+    if (logger->buffer_used) {
+      glr_logger_flush(logger);
+    }
+    pthread_mutex_unlock(&logger->mtx);
+  }
+  pthread_mutex_unlock(&glr_log_flusher_list_mtx);
+}
+
+void* glr_log_flusher_thread_func() {
+  while (!glr_log_flusher_thread_should_stop) {
+    glr_flush_logs();
+    sleep(1/*seconds*/);
+  }
+  return NULL;
+}
+
+void glr_log_start_flusher_thread_fn() {
+  pthread_create(&glr_log_flusher_thread, NULL, glr_log_flusher_thread_func,
+                 NULL);
+}
+
+void glr_log_cleanup_atexit_fn() {
+  glr_flush_logs();
+}
+
+void glr_log_cleanup_atexit_once_setup_fn() {
+  atexit(glr_log_cleanup_atexit_fn);
+}
+
+void glr_log_start_flusher_thread() {
+  pthread_once(&glr_log_flusher_thread_is_iniitialized,
+               glr_log_start_flusher_thread_fn);
+
+  pthread_once(&glr_log_atexit_is_iniitialized,
+               glr_log_cleanup_atexit_once_setup_fn);
+}
+
+void glr_log_stop_flusher_thread() {
+  glr_log_flusher_thread_should_stop = 1;
+  pthread_join(glr_log_flusher_thread, NULL);
+  glr_log_flusher_thread_is_iniitialized = PTHREAD_ONCE_INIT;
+}
+
+void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
+                      cstr_t source_location, cstr_t function_name,
+                      const char *format, ...) {
+  if (logger->min_level > level) {
+    return;
+  }
+  glr_allocator_t a = glr_create_transient_allocator(glr_get_default_allocator());
+  glr_push_allocator(&a);
+
+  char datetime_buffer[128];
+  int64_t ts_in_milliseconds = glr_timestamp_in_ms();
+  time_t ts_in_seconds = ts_in_milliseconds / 1000;
+  int32_t milliseconds = ts_in_milliseconds % 1000;
+
+  struct tm ts_breakdown = {};
+  gmtime_r(&ts_in_seconds, &ts_breakdown);
+
+  int datetime_len = strftime(datetime_buffer, sizeof(datetime_buffer) - 1,
+                              "%F %T.", &ts_breakdown);
+
+  datetime_len += snprintf(datetime_buffer + datetime_len,
+                           sizeof(datetime_buffer) - datetime_len - 1, "%03d",
+                           milliseconds);
+
+  str_t level_str = {};
+  switch (level) {
+    case GLR_LOG_LEVEL_TRACE: level_str = glr_log_level_trace_str; break;
+    case GLR_LOG_LEVEL_DEBUG: level_str = glr_log_level_debug_str; break;
+    case GLR_LOG_LEVEL_INFO: level_str = glr_log_level_info_str; break;
+    case GLR_LOG_LEVEL_WARNING: level_str = glr_log_level_warning_str; break;
+    case GLR_LOG_LEVEL_ERROR: level_str = glr_log_level_error_str; break;
+    case GLR_LOG_LEVEL_CRITICAL: level_str = glr_log_level_crit_str; break;
+  }
+
+  stringbuilder_t sb = glr_make_stringbuilder(512);
+  glr_stringbuilder_printf(&sb, "[%.*s] [%.*s:%.*s] %.*s ",
+                           datetime_len, datetime_buffer,
+                           source_location.len, source_location.data,
+                           function_name.len, function_name.data,
+                           level_str.len, level_str.data);
+
+  va_list va;
+  va_start(va, format);
+  glr_stringbuilder_vprintf(&sb, format, va);
+  va_end(va);
+  glr_stringbuilder_append(&sb, "\n", 1);
+
+  str_t entry = glr_stringbuilder_build(&sb);
+
+  //printf("%.*s\n", entry.len, entry.data);
+
+  pthread_mutex_lock(&logger->mtx);
+
+  ssize_t cap = sizeof(logger->buffer);
+  ssize_t cap_left = cap - logger->buffer_used;
+  if (cap_left < entry.len) {
+    glr_logger_flush(logger);
+  }
+
+  if (entry.len <= cap) {
+    memcpy(logger->buffer + logger->buffer_used, entry.data, entry.len);
+    logger->buffer_used += entry.len;
+  } else {
+    glr_safe_write(logger->fd, entry.data, entry.len);
+  }
+
+  pthread_mutex_unlock(&logger->mtx);
+
+  glr_pop_allocator();
+  glr_destroy_allocator(&a);
+}
+
+
 #ifdef GLR_CURL
 const char *glr_curl_error = "GLR_CURL_ERROR";
 
 typedef struct {
   glr_exec_context_t *in_context;
   CURLcode out_response_code;
-  err_t *err;
+  glr_error_t *err;
 } glr_curl_callback_info_t;
 
 typedef struct {
@@ -2166,7 +2442,7 @@ int glr_curl_handle_socket(CURL * /*easy*/, curl_socket_t s, int action,
                           void *userp, void *socketp);
 int glr_curl_start_timer(CURLM * /*multi*/, long timeout_ms, void *userp);
 
-CURLM *glr_get_curl_multi_handle(err_t *err) {
+CURLM *glr_get_curl_multi_handle(glr_error_t *err) {
   if (err->error) return NULL;
   glr_runtime_t *r = glr_cur_thread_runtime();
   if (!r->curl_multi_handle) {
@@ -2259,7 +2535,7 @@ int glr_curl_start_timer(CURLM *multi_info, long timeout_ms, void *userp) {
 }
 
 glr_curl_socket_data_t *glr_curl_create_socket(curl_socket_t sockfd,
-                                               CURLM *multi_info, err_t *err) {
+                                               CURLM *multi_info, glr_error_t *err) {
   glr_curl_socket_data_t *context = malloc(sizeof(glr_curl_socket_data_t));
   context->sockfd = sockfd;
   context->multi_info = multi_info;
@@ -2286,7 +2562,7 @@ int glr_curl_handle_socket(CURL *easy, curl_socket_t s, int action,
   glr_curl_callback_info_t *info = NULL;
   curl_easy_getinfo(easy, CURLINFO_PRIVATE, &info);
 
-  err_t *err = info->err;
+  glr_error_t *err = info->err;
   glr_curl_socket_data_t *curl_context;
   switch (action) {
     case CURL_POLL_IN:
@@ -2337,7 +2613,7 @@ int glr_curl_handle_socket(CURL *easy, curl_socket_t s, int action,
 
 
 
-CURLcode glr_curl_perform(CURL *handle, err_t *err) {
+CURLcode glr_curl_perform(CURL *handle, glr_error_t *err) {
   if (err->error) return 0;
 
 
@@ -2352,9 +2628,8 @@ CURLcode glr_curl_perform(CURL *handle, err_t *err) {
   curl_easy_setopt(handle, CURLOPT_PRIVATE, &info);
   CURLM *multi_handle = glr_get_curl_multi_handle(err);
   if (err->error) {
-    glr_stringbuilder_printf(&err->msg,
-                             "\n%s:%d:%s failed to get curl multi handle",
-                             __FILE__, __LINE__, __func__);
+    glr_err_printf(err, "\n%s:%d:%s failed to get curl multi handle", __FILE__,
+                   __LINE__, __func__);
     return CURLE_OK;
   }
   curl_multi_add_handle(multi_handle, handle);

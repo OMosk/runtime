@@ -1,0 +1,17 @@
+TODO:
+- multithreading loggers
+- compile time configurations of glr constraints
+- lock-free loggers
+- logging context for fibers
+- correct signal handling
+- http server
+- nonblocking dns
+- http client
+- utf8 utility functions
+- json
+- data structures
+- sorting and search
+- ndbclient
+- SNI for ssl servers
+
+

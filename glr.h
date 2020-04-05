@@ -41,13 +41,20 @@ void glr_allocator_free(glr_allocator_t *a, void *ptr);
 void glr_reset_allocator(glr_allocator_t *a);
 void glr_destroy_allocator(glr_allocator_t *a);
 
-glr_allocator_t glr_get_default_allocator();
-glr_allocator_t glr_get_transient_allocator(glr_allocator_t *parent);
+glr_allocator_t* glr_get_default_allocator();
+glr_allocator_t glr_create_transient_allocator(glr_allocator_t *parent);
 
 typedef struct {
   void *data;
   uint32_t cap;
 } glr_memory_block;
+
+typedef struct {
+  const char *data;
+  uint32_t len;
+  uint32_t cap;
+} cstr_t;
+
 
 typedef struct {
   char *data;
@@ -62,6 +69,8 @@ str_t glr_sprintf_ex(glr_allocator_t *a, const char *format, ...)
 
 str_t glr_strdup(str_t s);
 
+//TODO: resolve issue `const str_t` <-> `cstr_t`
+#define GLR_CSTR_LITERAL(s) ((cstr_t){(s), sizeof(s) - 1, sizeof(s) - 1})
 #define GLR_STR_LITERAL(s) ((str_t){(s), sizeof(s) - 1, sizeof(s) - 1})
 #define GLR_STRDUP_LITERAL(s) (glr_strdup(GLR_STR_LITERAL(s)))
 
@@ -121,23 +130,19 @@ void glr_scheduler_yield(int reschedule_current_ctx);
 
 //error handling
 
-enum {
-  ERROR_NONE = 0,
-  ERROR_TIMEOUT = 128,
-};
-
 typedef struct {
   void *error;
   int sub_error;
   stringbuilder_t msg;
-} err_t;
+} glr_error_t;
 
-void glr_err_cleanup(err_t *err);
+void glr_err_cleanup(glr_error_t *err);
+#define glr_err_printf(err, ...) glr_stringbuilder_printf(&((err)->msg), __VA_ARGS__)
 
 extern const char *glr_posix_error;
 #define GLR_POSIX_ERROR (&glr_posix_error)
 
-void glr_make_posix_error(err_t *err, const char *file, int line,
+void glr_make_posix_error(glr_error_t *err, const char *file, int line,
                           const char *func, const char *format, ...)
     __attribute__((format(printf, 5, 6)));
 #define GLR_MAKE_POSIX_ERROR(err, ...) \
@@ -168,10 +173,10 @@ typedef struct glr_poll_t {
   void *cb_arg;
 } glr_poll_t;
 
-void glr_add_poll(glr_poll_t *poll, int flags, err_t *err);
-void glr_change_poll(glr_poll_t *poll, int flags, err_t *err);
-void glr_remove_poll(glr_poll_t *poll, err_t *err);
-int glr_wait_for(int fd, uint32_t flags, err_t *err);
+void glr_add_poll(glr_poll_t *poll, int flags, glr_error_t *err);
+void glr_change_poll(glr_poll_t *poll, int flags, glr_error_t *err);
+void glr_remove_poll(glr_poll_t *poll, glr_error_t *err);
+int glr_wait_for(int fd, uint32_t flags, glr_error_t *err);
 
 typedef struct glr_timer_t {
   int64_t deadline_posix_milliseconds;
@@ -193,9 +198,9 @@ void glr_async_post(glr_runtime_t *r, glr_job_fn_t fn, void *arg);
 
 void glr_run_in_thread_pool(glr_job_fn_t fn, void *arg);
 
-struct sockaddr_storage glr_resolve_address(const char *host, const char *port, err_t *err);
-struct sockaddr_storage glr_resolve_address1(const char *host, int port, err_t *err);
-struct sockaddr_storage glr_resolve_address2(const char *addr, err_t *err);
+struct sockaddr_storage glr_resolve_address(const char *host, const char *port, glr_error_t *err);
+struct sockaddr_storage glr_resolve_address1(const char *host, int port, glr_error_t *err);
+struct sockaddr_storage glr_resolve_address2(const char *addr, glr_error_t *err);
 struct sockaddr_storage glr_resolve_unix_socket_addr(const char *path);
 
 str_t glr_addr_to_string(const struct sockaddr_storage *addr);
@@ -204,33 +209,33 @@ int glr_addr_get_port(const struct sockaddr_storage *addr);
 struct glr_fd_t;
 typedef struct glr_fd_t glr_fd_t;
 
-glr_fd_t *glr_init_fd(int fd, err_t *err);
+glr_fd_t *glr_init_fd(int fd, glr_error_t *err);
 void glr_close(glr_fd_t *fd);
 int glr_fd_get_native(glr_fd_t *fd);
 
 glr_fd_t *glr_listen(const struct sockaddr_storage *addr, int backlog,
-                     int reuse_port, err_t *err);
+                     int reuse_port, glr_error_t *err);
 
-typedef enum getsockname_err_t {
+typedef enum getsockname_glr_error_t {
   GETSOCKNAME_ERROR_NONE,
   GETSOCKNAME_ERROR_FAILED,
-} getsockname_err_t;
+} getsockname_glr_error_t;
 
-struct sockaddr_storage glr_socket_local_address(glr_fd_t *fd, err_t *err);
+struct sockaddr_storage glr_socket_local_address(glr_fd_t *fd, glr_error_t *err);
 
 typedef struct {
   glr_fd_t *con;
   struct sockaddr_storage address;
 } glr_accept_result_t;
 
-glr_accept_result_t glr_raw_accept(glr_fd_t *listener, err_t *err);
+glr_accept_result_t glr_raw_accept(glr_fd_t *listener, glr_error_t *err);
 
-glr_fd_t *glr_raw_connect(const struct sockaddr_storage *addr, int64_t deadline, err_t *err);
+glr_fd_t *glr_raw_connect(const struct sockaddr_storage *addr, int64_t deadline, glr_error_t *err);
 
 void glr_fd_set_deadline(glr_fd_t *fd, int64_t deadline);
-int glr_fd_raw_send(glr_fd_t *fd, const char *data, int len, err_t *err);
-int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, err_t *err);
-void glr_fd_raw_shutdown(glr_fd_t *fd, err_t *err);
+int glr_fd_raw_send(glr_fd_t *fd, const char *data, int len, glr_error_t *err);
+int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, glr_error_t *err);
+void glr_fd_raw_shutdown(glr_fd_t *fd, glr_error_t *err);
 
 //SSL
 extern const char *glr_ssl_error;
@@ -241,16 +246,16 @@ SSL_CTX *glr_ssl_server_context();
 SSL_CTX *glr_ssl_client_context();
 void glr_ssl_ctx_set_verify_peer(SSL_CTX *ctx, int verify);
 void glr_ssl_ctx_set_key(SSL_CTX *ctx, const char *path,
-                         const char *password, err_t *error);
-void glr_ssl_ctx_set_cert(SSL_CTX *ctx, const char *path, err_t *error);
+                         const char *password, glr_error_t *error);
+void glr_ssl_ctx_set_cert(SSL_CTX *ctx, const char *path, glr_error_t *error);
 
 void glr_ssl_client_conn_handshake(SSL_CTX *ctx, glr_fd_t *conn,
                                    const char *hostname, int64_t deadline,
-                                   err_t *err);
+                                   glr_error_t *err);
 void glr_ssl_server_conn_upgrade(SSL_CTX *context, glr_fd_t *conn,
-                                 int64_t deadline, err_t *err);
-int glr_ssl_read(glr_fd_t *impl, char *buffer, size_t len, err_t *err);
-int glr_ssl_write(glr_fd_t *impl, const char *buffer, size_t len, err_t *err);
+                                 int64_t deadline, glr_error_t *err);
+int glr_ssl_read(glr_fd_t *impl, char *buffer, size_t len, glr_error_t *err);
+int glr_ssl_write(glr_fd_t *impl, const char *buffer, size_t len, glr_error_t *err);
 void glr_ssl_shutdown(glr_fd_t *impl);
 SSL *glr_fd_conn_get_ssl(glr_fd_t *impl);
 SSL_CTX *glr_fd_conn_get_ssl_ctx(glr_fd_t *impl);
@@ -258,31 +263,79 @@ SSL_CTX *glr_fd_conn_get_ssl_ctx(glr_fd_t *impl);
 
 //Connection convenience tools
 glr_fd_t *glr_tcp_dial_hostname_port_ex(const char *host, const char *port,
-                                        int ssl, int64_t deadline, err_t *err);
+                                        int ssl, int64_t deadline, glr_error_t *err);
 
-glr_fd_t *glr_tcp_dial_addr(const char *addr, int64_t deadline, err_t *err);
-glr_fd_t *glr_tcp_dial_addr_ssl(const char *addr, int64_t deadline, err_t *err);
+glr_fd_t *glr_tcp_dial_addr(const char *addr, int64_t deadline, glr_error_t *err);
+glr_fd_t *glr_tcp_dial_addr_ssl(const char *addr, int64_t deadline, glr_error_t *err);
 glr_fd_t *glr_tcp_dial_hostname_port(const char *hostname, const char *port,
-                                     int64_t deadline, err_t *err);
+                                     int64_t deadline, glr_error_t *err);
 glr_fd_t *glr_tcp_dial_hostname_port_ssl(const char *hostname, const char *port,
-                                         int64_t deadline, err_t *err);
+                                         int64_t deadline, glr_error_t *err);
 
 glr_fd_t *glr_tcp_dial_hostname_port2(const char *hostname, uint16_t port,
-                                      int64_t deadline, err_t *err);
+                                      int64_t deadline, glr_error_t *err);
 glr_fd_t *glr_tcp_dial_hostname_port_ssl2(const char *hostname, uint16_t port,
-                                          int64_t deadline, err_t *err);
+                                          int64_t deadline, glr_error_t *err);
 
-int glr_fd_conn_send(glr_fd_t *conn, const char *data, size_t len, err_t *err);
-int glr_fd_conn_recv(glr_fd_t *conn, char *data, size_t len, err_t *err);
-void glr_fd_conn_shutdown(glr_fd_t *conn, err_t *err);
+int glr_fd_conn_send(glr_fd_t *conn, const char *data, size_t len, glr_error_t *err);
+int glr_fd_conn_recv(glr_fd_t *conn, char *data, size_t len, glr_error_t *err);
+void glr_fd_conn_shutdown(glr_fd_t *conn, glr_error_t *err);
 
-int glr_fd_conn_send_exactly(glr_fd_t *conn, const char *data, size_t len, err_t *err);
-int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, err_t *err);
+int glr_fd_conn_send_exactly(glr_fd_t *conn, const char *data, size_t len, glr_error_t *err);
+int glr_fd_conn_recv_exactly(glr_fd_t *conn, char *data, size_t len, glr_error_t *err);
+
+//Logging
+
+typedef enum {
+  GLR_LOG_LEVEL_TRACE,
+  GLR_LOG_LEVEL_DEBUG,
+  GLR_LOG_LEVEL_INFO,
+  GLR_LOG_LEVEL_WARNING,
+  GLR_LOG_LEVEL_ERROR,
+  GLR_LOG_LEVEL_CRITICAL,
+} glr_log_level_t;
+
+struct glr_logger_t;
+typedef struct glr_logger_t glr_logger_t;
+
+struct glr_logger_t *glr_logger_create(const char *filename, glr_error_t *e);
+void glr_logger_destroy(struct glr_logger_t *logger);
+
+glr_logger_t *glr_get_stdout_logger();
+glr_logger_t *glr_get_stderr_logger();
+
+glr_logger_t *glr_get_default_logger();
+void glr_set_default_logger(glr_logger_t *logger);
+glr_logger_t *glr_get_logger();
+void glr_set_logger(glr_logger_t *logger);
+void glr_set_min_log_level(glr_logger_t *logger, glr_log_level_t level);
+
+#define GLR_SOURCE_LOCATION_STRINGIFY2(X) #X
+#define GLR_SOURCE_LOCATION_STRINGIFY(X) GLR_SOURCE_LOCATION_STRINGIFY2(X)
+#define GLR_SOURCE_LOCATION \
+  GLR_CSTR_LITERAL(__FILE__ ":" GLR_SOURCE_LOCATION_STRINGIFY(__LINE__))
+
+void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
+                      cstr_t source_location, cstr_t function_name,
+                      const char *format, ...);
+
+#define glr_log2(logger, level, ...)                    \
+  glr_log_detailed(logger, level, GLR_SOURCE_LOCATION, \
+                   GLR_CSTR_LITERAL(__func__), __VA_ARGS__)
+
+#define glr_log(level, ...) glr_log2(glr_get_logger(), level, __VA_ARGS__)
+#define glr_log_trace(...) glr_log(GLR_LOG_LEVEL_TRACE, __VA_ARGS__)
+#define glr_log_debug(...) glr_log(GLR_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#define glr_log_info(...) glr_log(GLR_LOG_LEVEL_INFO, __VA_ARGS__)
+#define glr_log_warn(...) glr_log(GLR_LOG_LEVEL_WARNING, __VA_ARGS__)
+#define glr_log_error(...) glr_log(GLR_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define glr_log_crit(...) glr_log(GLR_LOG_LEVEL_CRITICAL, __VA_ARGS__)
+
+//
 
 #ifdef GLR_CURL
-
 extern const char *glr_curl_error;
 #define GLR_CURL_ERROR (&glr_curl_error)
 
-CURLcode glr_curl_perform(CURL *handle, err_t *err);
-#endif
+CURLcode glr_curl_perform(CURL *handle, glr_error_t *err);
+#endif //GLR_CURL
