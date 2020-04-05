@@ -1737,10 +1737,29 @@ static void test_loggers_flush() {
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
 }
 
+static void test_logging_context() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
+  glr_push_allocator(&a);
+
+  glr_append_logging_context("user_id=%d;ip=%s;",123, "127.0.0.1");
+  glr_log_info("Testing logging context");
+
+  glr_append_logging_context("handler=%s;", "sign-in");
+  glr_log_info("Testing logging context again");
+
+  glr_pop_allocator();
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
 int main() {
-  int async_tests_enabled = 1;
-  int dns_tests_enabled = 1;
-  int curl_tests_enabled = 1;
+  int async_tests_enabled = 0;
+  int dns_tests_enabled = 0;
+  int curl_tests_enabled = 0;
 
   label_pointers();
   error_handling();
@@ -1821,6 +1840,7 @@ int main() {
   }
 
   test_loggers();
+  test_logging_context();
 
   //these test should be last
   test_loggers_flush();

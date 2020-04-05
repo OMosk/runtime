@@ -317,7 +317,8 @@ void glr_set_min_log_level(glr_logger_t *logger, glr_log_level_t level);
 
 void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
                       cstr_t source_location, cstr_t function_name,
-                      const char *format, ...);
+                      const char *format, ...)
+    __attribute__((format(printf, 5, 6)));
 
 #define glr_log2(logger, level, ...)                    \
   glr_log_detailed(logger, level, GLR_SOURCE_LOCATION, \
@@ -330,6 +331,12 @@ void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
 #define glr_log_warn(...) glr_log(GLR_LOG_LEVEL_WARNING, __VA_ARGS__)
 #define glr_log_error(...) glr_log(GLR_LOG_LEVEL_ERROR, __VA_ARGS__)
 #define glr_log_crit(...) glr_log(GLR_LOG_LEVEL_CRITICAL, __VA_ARGS__)
+
+str_t glr_get_logging_context();
+void glr_cleanup_logging_context();
+void glr_reset_logging_context();
+void glr_append_logging_context(const char *format, ...)
+    __attribute__((format(printf, 1, 2)));
 
 //
 

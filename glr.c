@@ -58,6 +58,7 @@ struct glr_exec_context_t {
   glr_exec_stack_t *stack;
   glr_allocator_t *saved_allocator;
   glr_logger_t *logger;
+  str_t logging_context;
 };
 
 typedef struct {
@@ -676,6 +677,7 @@ glr_exec_context_t *glr_get_context_from_freelist() {
   glr_runtime.free_contexts_len--;
   result->saved_allocator = NULL;
   result->logger = NULL;
+  result->logging_context = (str_t){};
   return result;
 }
 
@@ -2383,11 +2385,18 @@ void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
   }
 
   stringbuilder_t sb = glr_make_stringbuilder(512);
-  glr_stringbuilder_printf(&sb, "[%.*s] [%.*s:%.*s] %.*s ",
+  glr_stringbuilder_printf(&sb, "[%.*s] %.*s [%.*s:%.*s] ",
                            datetime_len, datetime_buffer,
+                           level_str.len, level_str.data,
                            source_location.len, source_location.data,
-                           function_name.len, function_name.data,
-                           level_str.len, level_str.data);
+                           function_name.len, function_name.data
+                           );
+
+  str_t logging_context = glr_get_logging_context();
+  if (logging_context.len) {
+    glr_stringbuilder_printf(&sb, "[%.*s] ", logging_context.len,
+                             logging_context.data);
+  }
 
   va_list va;
   va_start(va, format);
@@ -2418,6 +2427,31 @@ void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
 
   glr_pop_allocator();
   glr_destroy_allocator(&a);
+}
+
+str_t glr_get_logging_context() {
+  return glr_current_context()->logging_context;
+}
+void glr_cleanup_logging_context() {
+  glr_current_context()->logging_context.len = 0;
+}
+void glr_reset_logging_context() {
+  glr_current_context()->logging_context = (str_t){};
+}
+void glr_append_logging_context(const char *format, ...) {
+  glr_exec_context_t *exec_ctx = glr_current_context();
+  str_t *log_ctx = &exec_ctx->logging_context;
+  if (log_ctx->cap == 0) {
+    //TODO: move this constant to some configuration variable
+    log_ctx->cap = 512;
+    log_ctx->data = GLR_ALLOCATE_ARRAY(char, log_ctx->cap);
+  }
+  va_list va;
+  va_start(va, format);
+  log_ctx->len += vsnprintf(log_ctx->data + log_ctx->len,
+                            log_ctx->cap - log_ctx->len,
+                            format, va);
+  va_end(va);
 }
 
 
