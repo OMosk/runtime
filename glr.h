@@ -237,6 +237,9 @@ int glr_fd_raw_send(glr_fd_t *fd, const char *data, int len, glr_error_t *err);
 int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, glr_error_t *err);
 void glr_fd_raw_shutdown(glr_fd_t *fd, glr_error_t *err);
 
+// implemented for signalfd
+int glr_fd_raw_read(glr_fd_t *fd, char *data, int len, glr_error_t *err);
+
 //SSL
 extern const char *glr_ssl_error;
 #define GLR_SSL_ERROR (&glr_ssl_error)
@@ -339,6 +342,14 @@ void glr_append_logging_context(const char *format, ...)
     __attribute__((format(printf, 1, 2)));
 
 //
+void glr_daemonize();
+
+typedef void (*glr_signal_handling_function)(int signal, void *data);
+void glr_launch_signal_handling_thread(glr_signal_handling_function fn,
+                                       void *data);
+
+glr_fd_t *glr_signalfd(int *signals, glr_error_t *e);
+void glr_block_signals(int *signals, glr_error_t *e);
 
 #ifdef GLR_CURL
 extern const char *glr_curl_error;

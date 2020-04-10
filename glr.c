@@ -22,6 +22,8 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/signalfd.h>
 
 #ifdef GLR_VALGRIND
 #    include <valgrind/valgrind.h>
@@ -1705,6 +1707,26 @@ int glr_fd_raw_recv(glr_fd_t *fd, char *data, int len, glr_error_t *err) {
   }
 }
 
+int glr_fd_raw_read(glr_fd_t *fd, char *data, int len, glr_error_t *err) {
+  if (err->error) return -1;
+  for (;;) {
+    int result = read(glr_fd_get_native(fd), data, len);
+    if (result >= 0) return result;
+    if (errno == EINTR) continue;
+    if (errno != EAGAIN) {
+      GLR_MAKE_POSIX_ERROR(err, ": syscall read(..., ..., %d) failed", len);
+      return -1;
+    }
+    glr_fd_wait_until(fd, EPOLLIN|EPOLLRDHUP|EPOLLERR, fd->deadline, err);
+    if (err->error) {
+      glr_stringbuilder_printf(
+          &err->msg, "\n%s:%d:%s glr_fd_wait_until(EPOLLIN|EPOLLRDHUP|EPOLLERR)",
+          __FILE__, __LINE__, __func__);
+      return -1;
+    }
+  }
+}
+
 void glr_fd_raw_shutdown(glr_fd_t *fd, glr_error_t *err) {
   if (err->error) return;
   int result = shutdown(glr_fd_get_native(fd), SHUT_RDWR);
@@ -2454,6 +2476,97 @@ void glr_append_logging_context(const char *format, ...) {
   va_end(va);
 }
 
+void glr_daemonize() {
+  pid_t pid = fork();
+  if (pid < 0) abort();
+  if (pid > 0) exit(0);
+  umask(002);
+  pid_t sid = setsid();
+  if (sid < 0) abort();
+  if ((chdir("/")) < 0) abort();
+  freopen("/dev/null", "r", stdin);
+  freopen("/dev/null", "a", stdout);
+  freopen("/dev/null", "a", stderr);
+}
+
+struct glr_signal_handling_function_pack {
+  glr_signal_handling_function fn;
+  void *data;
+};
+
+static void *glr_signal_handling_thread_fn(void *arg) {
+  printf("signal handling thread started \n");
+  struct glr_signal_handling_function_pack *pack = arg;
+  sigset_t mask;
+
+  sigfillset(&mask);
+  //pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
+
+  int n, signal;
+  for (;;) {
+    n = sigwait(&mask, &signal);
+    printf("SIGNAL received\n");
+    if (n != 0) {
+      abort();
+    }
+    pack->fn(signal, pack->data);
+  }
+
+  return NULL;
+}
+
+void glr_launch_signal_handling_thread(glr_signal_handling_function fn,
+                                       void *data) {
+  sigset_t mask;
+  sigfillset(&mask);
+  pthread_sigmask(SIG_BLOCK, &mask, NULL);
+  struct glr_signal_handling_function_pack *pack =
+      malloc(sizeof(struct glr_signal_handling_function_pack));
+  pack->fn = fn;
+  pack->data = data;
+  pthread_t signal_handling_thread;
+  pthread_create(&signal_handling_thread, NULL, &glr_signal_handling_thread_fn,
+    pack);
+  pthread_detach(signal_handling_thread);
+}
+
+glr_fd_t *glr_signalfd(int *signals, glr_error_t *e) {
+  if (e->error) return NULL;
+
+  sigset_t mask;
+  sigemptyset(&mask);
+  for (int *it = signals; *it != 0; ++it) {
+    sigaddset(&mask, *it);
+  }
+  int fd = signalfd(-1, &mask, SFD_NONBLOCK|SFD_CLOEXEC);
+  if (fd == -1) {
+    GLR_MAKE_POSIX_ERROR(e, ": signalfd (...) SFD_NONBLOCK|SFD_CLOEXEC failed");
+    return NULL;
+  }
+
+  glr_fd_t *result = glr_init_fd(fd, e);
+  if (e->error) {
+    glr_stringbuilder_printf(&e->msg, "\n%s:%d:%s: glr_init_fd() failed",
+                             __FILE__, __LINE__, __func__);
+    return NULL;
+  }
+  return result;
+}
+
+void glr_block_signals(int *signals, glr_error_t *e) {
+  if (e->error) return;
+  sigset_t mask;
+  sigemptyset(&mask);
+  for (int *it = signals; *it != 0; ++it) {
+    sigaddset(&mask, *it);
+  }
+  int s = pthread_sigmask(SIG_BLOCK, &mask, NULL);
+  if (s != 0) {
+    errno = s;
+    GLR_MAKE_POSIX_ERROR(e, ": pthread_sigmask(SIG_BLOCK, ...) failed");
+    return;
+  }
+}
 
 #ifdef GLR_CURL
 const char *glr_curl_error = "GLR_CURL_ERROR";

@@ -11,8 +11,11 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
+#include <sys/signalfd.h>
 #include <sys/un.h>
 #include <time.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include "glr.h"
@@ -1756,10 +1759,83 @@ static void test_logging_context() {
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
 }
 
+void signal_handling_function(int signal, void *data) {
+  printf("received signal %d data=%p on %ld\n", signal, data, syscall(SYS_gettid));
+}
+
+static void test_signal_handling_thread() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+  int a = 0;
+  printf("setup signal handler data=%p on %ld\n", &a, syscall(SYS_gettid));
+  glr_launch_signal_handling_thread(signal_handling_function, &a);
+  printf("sending %d signal\n", SIGUSR1);
+  int n = kill(getpid(), SIGUSR1);
+  if (n) {
+    printf("raise() failed\n");
+  }
+  glr_sleep(100);
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
+static void test_signalfd() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
+  glr_push_allocator(&a);
+
+  glr_error_t e = {};
+
+  int signals[] = {SIGALRM, 0};
+  glr_block_signals(signals, &e);
+  if (e.error) {
+    str_t s = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n",
+      __FILE__, __LINE__, __func__, s.len, s.data);
+    abort();
+  }
+
+  glr_fd_t *fd = glr_signalfd(signals, &e);
+  if (e.error) {
+    str_t s = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n",
+      __FILE__, __LINE__, __func__, s.len, s.data);
+    abort();
+  }
+
+  alarm(1);
+
+  struct signalfd_siginfo siginfo = {};
+  glr_fd_raw_read(fd, (char *)&siginfo, sizeof(siginfo), &e);
+  if (e.error) {
+    str_t s = glr_stringbuilder_build(&e.msg);
+    printf("%s:%d:%s %.*s\n",
+      __FILE__, __LINE__, __func__, s.len, s.data);
+    abort();
+  }
+
+  printf("Caught signal %d (SIGALRM=%d)\n", siginfo.ssi_signo, SIGALRM);
+
+  if (siginfo.ssi_signo != SIGALRM) {
+    printf("%s:%d:%s received wrong signal: %d instead of %d\n",
+      __FILE__, __LINE__, __func__,
+      siginfo.ssi_signo, SIGALRM);
+  }
+
+  glr_close(fd);
+
+  glr_pop_allocator();
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
 int main() {
   int async_tests_enabled = 0;
   int dns_tests_enabled = 0;
   int curl_tests_enabled = 0;
+  test_signalfd();
+  test_signal_handling_thread();
 
   label_pointers();
   error_handling();
@@ -1841,6 +1917,8 @@ int main() {
 
   test_loggers();
   test_logging_context();
+
+
 
   //these test should be last
   test_loggers_flush();

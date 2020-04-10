@@ -1,8 +1,6 @@
 TODO:
-- logging context for fibers
 - compile time configurations of glr constraints
 - lock-free loggers
-- correct signal handling
 - http server
 - nonblocking dns
 - http client
