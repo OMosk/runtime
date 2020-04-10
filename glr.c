@@ -2445,6 +2445,10 @@ void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
     glr_safe_write(logger->fd, entry.data, entry.len);
   }
 
+  if (level >= GLR_LOG_LEVEL_WARNING) {
+    glr_logger_flush(logger);
+  }
+
   pthread_mutex_unlock(&logger->mtx);
 
   glr_pop_allocator();

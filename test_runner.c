@@ -1759,6 +1759,23 @@ static void test_logging_context() {
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
 }
 
+static void test_logger_autoflush_on_high_levels() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+  glr_allocator_t a = glr_create_transient_allocator(NULL);
+  glr_push_allocator(&a);
+
+  struct glr_logger_t *stdout_logger = glr_get_stdout_logger();
+  glr_set_default_logger(stdout_logger);
+
+  glr_log_trace("Minor log message");
+  glr_log_error("Serious error message");
+
+  glr_pop_allocator();
+  glr_destroy_allocator(&a);
+  glr_cur_thread_runtime_cleanup();
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
 void signal_handling_function(int signal, void *data) {
   printf("received signal %d data=%p on %ld\n", signal, data, syscall(SYS_gettid));
 }
@@ -1917,8 +1934,7 @@ int main() {
 
   test_loggers();
   test_logging_context();
-
-
+  test_logger_autoflush_on_high_levels();
 
   //these test should be last
   test_loggers_flush();
