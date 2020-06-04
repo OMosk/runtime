@@ -357,3 +357,15 @@ extern const char *glr_curl_error;
 
 CURLcode glr_curl_perform(CURL *handle, glr_error_t *err);
 #endif //GLR_CURL
+
+
+#if __has_extension(blocks)
+static inline void glr_call_block(void (^*b)(void)) { (*b)(); }
+
+#define GLR_COMBINE1(X, Y) X ## Y
+#define GLR_COMBINE(X, Y) GLR_COMBINE1(X, Y)
+#define glr_defer __attribute__((cleanup(glr_call_block))) void (^GLR_COMBINE(defer_scopevar_,__LINE__))() =^
+#else
+#define glr_defer #error "clang blocks was used but not available, add -fblock -l:libBlocksRuntime.a to compilation flags"
+#endif
+

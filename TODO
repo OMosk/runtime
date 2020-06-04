@@ -1,8 +1,10 @@
 TODO:
+- simplify memory allocation stack
+- OpenSSL via dlopen
+- nonblocking dns (getaddrinfo_a dlopen)
 - compile time configurations of glr constraints
 - lock-free loggers
 - http server
-- nonblocking dns
 - http client
 - utf8 utility functions
 - json
@@ -10,5 +12,7 @@ TODO:
 - sorting and search
 - ndbclient
 - SNI for ssl servers
-
+- implement or integrate websockets
+- subprocess execution
+- MySQL driver
 
