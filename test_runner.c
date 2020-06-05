@@ -72,6 +72,7 @@ exit:
   return;
 }
 
+/*
 static void test_global_malloc_free_adapter() {
   TEST;
   glr_allocator_t *global = glr_get_default_allocator();
@@ -81,8 +82,9 @@ static void test_global_malloc_free_adapter() {
   glr_reset_allocator(global);
   glr_destroy_allocator(global);
 }
+*/
 
-static void test_body_transient_allocator(glr_allocator_t *alloc) {
+static void test_body_transient_allocator(glr_transient_allocator_t *alloc) {
   TEST;
   typedef struct {
     uint32_t field1;
@@ -116,7 +118,7 @@ static void test_body_transient_allocator(glr_allocator_t *alloc) {
   int cases_len = sizeof(cases) / sizeof(cases[0]);
   for (int i = 0; i < cases_len; ++i) {
     cases[i].result_ptr =
-        glr_allocator_alloc(alloc, cases[i].size, cases[i].alignment);
+        glr_alloc_from_transient_allocator(alloc, cases[i].size, cases[i].alignment);
   }
 
   for (int i = 0; i < cases_len; ++i) {
@@ -139,22 +141,21 @@ static void test_body_transient_allocator(glr_allocator_t *alloc) {
       *it = 'A';
     }
 
-    glr_allocator_free(alloc, c->result_ptr);
   }
 }
 
 static void test_transient_allocator() {
   TEST;
-  glr_allocator_t alloc = glr_create_transient_allocator(NULL);
+  glr_transient_allocator_t *alloc = glr_create_transient_allocator();
 
-  test_body_transient_allocator(&alloc);
+  test_body_transient_allocator(alloc);
 
   printf(">>>Resetting transient allocator\n");
-  glr_reset_allocator(&alloc);
+  glr_reset_transient_allocator(alloc);
 
-  test_body_transient_allocator(&alloc);
+  test_body_transient_allocator(alloc);
 
-  glr_destroy_allocator(&alloc);
+  glr_destroy_transient_allocator(alloc);
 }
 
 static void test_transient_allocator2() {
@@ -164,28 +165,28 @@ static void test_transient_allocator2() {
   // resetting allocator, request allocating of 8192, 0th block would not be
   // able to contain this data as 1st, so it should allocated 8192 block and swap
   // it with 1st
-  glr_allocator_t alloc = glr_create_transient_allocator(NULL);
+  glr_transient_allocator_t *alloc = glr_create_transient_allocator();
 
-  glr_allocator_alloc(&alloc, 4096, 1);
-  glr_allocator_alloc(&alloc, 4096, 1);
-  glr_allocator_alloc(&alloc, 4096, 1);
-  glr_reset_allocator(&alloc);
+  glr_alloc_from_transient_allocator(alloc, 4096, 1);
+  glr_alloc_from_transient_allocator(alloc, 4096, 1);
+  glr_alloc_from_transient_allocator(alloc, 4096, 1);
+  glr_reset_transient_allocator(alloc);
   printf(">>>Resetting transient allocator\n");
-  char *data = glr_allocator_alloc(&alloc, 8192, 1);
+  char *data = glr_alloc_from_transient_allocator(alloc, 8192, 1);
   for (int i = 0; i < 8192; ++i) {
     data[i] = 'z';
   }
 
-  glr_destroy_allocator(&alloc);
+  glr_destroy_transient_allocator(alloc);
 }
 
 static void test_glr_sprintf() {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
 
   printf("%s:%d:%s Float=%.6f'\n", __FILE__, __LINE__, __func__, 123.45);
 
-  str_t string = glr_sprintf_ex(&a, "%s:%d:%s Float=%.6fEnd", __FILE__,
+  str_t string = glr_sprintf_ex(a, "%s:%d:%s Float=%.6fEnd", __FILE__,
                                 __LINE__, __func__, 123.45);
 
   fwrite(string.data, 1, string.len, stdout);
@@ -195,25 +196,25 @@ static void test_glr_sprintf() {
     abort();
   }
 
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
 }
 
-static void test_glr_malloc_free() {
-  int *a = GLR_ALLOCATE_TYPE(int);
-  *a = 5;
-  glr_free(a);
-}
+//static void test_glr_malloc_free() {
+//  int *a = GLR_ALLOCATE_TYPE(int);
+//  *a = 5;
+//  glr_free(a);
+//}
 
 static void test_allocators_stack() {
   if (glr_current_allocator() == NULL) {
     abort();
   }
 
-  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a1);
+  glr_transient_allocator_t *a1 = glr_create_transient_allocator();
+  glr_push_allocator(a1);
 
-  glr_allocator_t *cur = glr_current_allocator();
-  if (cur != &a1) {
+  glr_transient_allocator_t *cur = glr_current_allocator();
+  if (cur != a1) {
     abort();
   }
 
@@ -221,17 +222,17 @@ static void test_allocators_stack() {
   *a = 5;
 
   cur = glr_pop_allocator();
-  if (cur != &a1) {
+  if (cur != a1) {
     abort();
   }
 
-  glr_destroy_allocator(&a1);
+  glr_destroy_transient_allocator(a1);
 }
 
 static void test_stringbuilder() {
   TEST;
-  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a1);
+  glr_transient_allocator_t *a1 = glr_create_transient_allocator();
+  glr_push_allocator(a1);
 
   stringbuilder_t sb = glr_make_stringbuilder(256);
   glr_stringbuilder_printf(&sb, "Hello world %d, %s", 123, "End");
@@ -250,13 +251,13 @@ static void test_stringbuilder() {
   }
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a1);
+  glr_destroy_transient_allocator(a1);
 }
 
 static void test_stringbuilder2() {
   TEST;
-  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a1);
+  glr_transient_allocator_t *a1 = glr_create_transient_allocator();
+  glr_push_allocator(a1);
 
   stringbuilder_t sb = glr_make_stringbuilder(5);
   glr_stringbuilder_printf(&sb, "Hello world %d, %s", 123, "End");
@@ -273,15 +274,15 @@ static void test_stringbuilder2() {
   printf("%s\n", result.data);
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a1);
+  glr_destroy_transient_allocator(a1);
 }
 
 static void test_stringbuilder3() {
   TEST;
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   // testing append
-  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a1);
+  glr_transient_allocator_t *a1 = glr_create_transient_allocator();
+  glr_push_allocator(a1);
 
   const char str[] = "'Hello World'";
 
@@ -306,7 +307,7 @@ static void test_stringbuilder3() {
   printf("%s\n", result.data);
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a1);
+  glr_destroy_transient_allocator(a1);
 }
 
 static void test_stringbuilder4() {
@@ -319,9 +320,10 @@ static void test_stringbuilder4() {
   glr_stringbuilder_append(&sb, str, sizeof(str) - 1);
 
   str_t result = glr_stringbuilder_build(&sb);
-  glr_stringbuilder_free_buffers(&sb);
+  //glr_stringbuilder_free_buffers(&sb);
   printf("%s\n", result.data);
-  glr_free(result.data);
+  glr_reset_transient_allocator(glr_current_allocator());
+  //glr_free(result.data);
 }
 
 static void bench_emptysnprintf_len_calculation() {
@@ -523,7 +525,7 @@ static void test_poll() {
 
   close(fd);
   glr_cur_thread_runtime_cleanup();
-  glr_err_cleanup(&err);
+  //glr_err_cleanup(&err);
 }
 
 static void test_error_handling() {
@@ -534,44 +536,44 @@ static void test_error_handling() {
   if (err.error) {
     str_t msg = glr_stringbuilder_build(&err.msg);
     printf("Expected error: %*s\n", msg.len, msg.data);
-    glr_free(msg.data);
+    //glr_free(msg.data);
   } else {
     abort();
   }
 
   glr_cur_thread_runtime_cleanup();
-  glr_err_cleanup(&err);
+  //glr_err_cleanup(&err);
 }
 
-static void test_transient_allocator_embedding() {
-  TEST;
-  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a1);
-
-  glr_allocator_t a2 = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a2);
-
-  stringbuilder_t sb = {};
-  glr_stringbuilder_printf(&sb, "%s", "Hello world");
-  str_t s = glr_stringbuilder_build(&sb);
-  printf("Built string: %.*s\n", s.len, s.data);
-
-  glr_pop_allocator();
-  glr_pop_allocator();
-  glr_destroy_allocator(&a1);
-}
+//static void test_transient_allocator_embedding() {
+//  TEST;
+//  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
+//  glr_push_allocator(&a1);
+//
+//  glr_allocator_t a2 = glr_create_transient_allocator(NULL);
+//  glr_push_allocator(&a2);
+//
+//  stringbuilder_t sb = {};
+//  glr_stringbuilder_printf(&sb, "%s", "Hello world");
+//  str_t s = glr_stringbuilder_build(&sb);
+//  printf("Built string: %.*s\n", s.len, s.data);
+//
+//  glr_pop_allocator();
+//  glr_pop_allocator();
+//  glr_destroy_allocator(&a1);
+//}
 
 static void bench_transient_allocation() {
   TEST;
-  glr_allocator_t a1 = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a1);
+  glr_transient_allocator_t *a1 = glr_create_transient_allocator();
+  glr_push_allocator(a1);
 
   printf("%s:%d:%s \n", __FILE__, __LINE__, __func__);
   struct timespec start;
   clock_gettime(CLOCK_MONOTONIC, &start);
   int n = 10000;
   for (int i = 0; i < n; ++i) {
-    (void)glr_malloc(1, 1);
+    (void)glr_alloc_from_transient_allocator(glr_current_allocator(), 1, 1);
   }
   struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
@@ -580,7 +582,7 @@ static void bench_transient_allocation() {
   printf("transient malloc: %d iterations took = %f secs\n", n, elapsed / 1e9);
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a1);
+  glr_destroy_transient_allocator(a1);
 }
 
 struct test_timers_data {
@@ -656,16 +658,16 @@ static void test_timers() {
 
 static void allocator_use_coro(void *arg) {
   (void)arg;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_scheduler_yield(1);
 
-  if (glr_current_allocator() != &a) {
+  if (glr_current_allocator() != a) {
     abort();
   }
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
 }
 
 static void test_allocator_preserving_between_coros() {
@@ -917,8 +919,8 @@ static void test_sleep() {
 
 static void test_address_resolving(const char *addr) {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   glr_error_t e = {};
   struct sockaddr_storage packed_address = glr_resolve_address2(addr, &e);
@@ -932,14 +934,14 @@ static void test_address_resolving(const char *addr) {
   str_t ip_port_str = glr_addr_to_string(&packed_address);
   printf("%s resolved to %.*s\n", addr, ip_port_str.len, ip_port_str.data);
 
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_address_not_resolving(const char *addr) {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   glr_error_t e = {};
   struct sockaddr_storage packed_address = glr_resolve_address2(addr, &e);
@@ -954,14 +956,14 @@ static void test_address_not_resolving(const char *addr) {
   }
   (void)packed_address;
 
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_tcp_listening(const char *requested_addr) {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -984,14 +986,14 @@ static void test_tcp_listening(const char *requested_addr) {
 
   glr_close(listener);
 
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_unix_listening(const char *requested_addr) {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1015,14 +1017,14 @@ static void test_unix_listening(const char *requested_addr) {
 
   glr_close(listener);
 
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_fd_freelist_reuse(const char *unix_socket_addr) {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1048,7 +1050,7 @@ static void test_fd_freelist_reuse(const char *unix_socket_addr) {
     glr_close(listener);
   }
 
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
@@ -1071,8 +1073,8 @@ void *test_accept_thread_fn(void *arg) {
 
 static void test_accept(const char *requested_addr) {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1118,7 +1120,8 @@ static void test_accept(const char *requested_addr) {
 
   glr_close(listener);
 
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
@@ -1128,8 +1131,8 @@ typedef struct {
 
 static void test_send_recv_coro_fn(void *arg) {
   test_send_recv_data_t *td = arg;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   glr_error_t e = {};
   glr_fd_t *conn = glr_raw_connect(td->addr, glr_timestamp_in_ms() + 1000, &e);
@@ -1147,13 +1150,14 @@ static void test_send_recv_coro_fn(void *arg) {
     abort();
   }
   glr_close(conn);
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
 }
 
 static void test_send_recv() {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1185,14 +1189,15 @@ static void test_send_recv() {
 
   glr_close(conn);
   glr_close(listener);
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_connect_timeout() {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1213,14 +1218,15 @@ static void test_connect_timeout() {
   }
 
   (void)conn;
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_recv_timeout() {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1252,14 +1258,15 @@ static void test_recv_timeout() {
 
   glr_close(conn);
   glr_close(listener);
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
 static void test_send_timeout() {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1296,7 +1303,8 @@ static void test_send_timeout() {
 
   glr_close(conn);
   glr_close(listener);
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
@@ -1304,8 +1312,8 @@ static void test_ssl_connect(const char *domain, const char *port) {
   printf("%s:%d:%s ssl connect %s:%s\n", __FILE__, __LINE__, __func__, domain,
          port);
 
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
 
   struct sockaddr_storage packed_address =
@@ -1333,7 +1341,8 @@ static void test_ssl_connect(const char *domain, const char *port) {
 
   SSL_CTX_free(ctx);
   glr_close(conn);
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
@@ -1405,8 +1414,8 @@ void *ssl_accept_test_connection_thread(void *arg) {
 
 static void test_ssl_accept() {
   TEST;
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
   glr_error_t e = {};
   SSL_CTX *ctx = glr_ssl_server_context();
   glr_ssl_ctx_set_key(ctx, "./certs/key.pem", /*password*/ NULL, &e);
@@ -1452,7 +1461,8 @@ static void test_ssl_accept() {
   glr_close(accept_result.con);
   glr_close(listener);
   SSL_CTX_free(ctx);
-  glr_destroy_allocator(&a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 }
 
@@ -1556,7 +1566,7 @@ static void test_fd_conn_functions() {
 }
 
 typedef struct {
-  glr_allocator_t a;
+  glr_transient_allocator_t *a;
   stringbuilder_t sb;
 } curl_perform_test_data_t;
 
@@ -1565,7 +1575,7 @@ size_t curl_perform_write_cb(void *contents, size_t size, size_t nmemb,
   (void)userp;
   size_t realsize = size * nmemb;
   curl_perform_test_data_t *td = userp;
-  glr_push_allocator(&td->a);
+  glr_push_allocator(td->a);
   glr_stringbuilder_append(&td->sb, contents, realsize);
   glr_pop_allocator();
   // printf("received %lu bytes, total=%lu\n", realsize, response_body->size());
@@ -1584,8 +1594,8 @@ static void curl_perform_test(const char *url, ssize_t expected_size) {
   CURLcode res = CURLE_OK;
 
   curl_perform_test_data_t td = {};
-  td.a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&td.a);
+  td.a = glr_create_transient_allocator();
+  glr_push_allocator(td.a);
   td.sb = glr_make_stringbuilder(4096);
 
   curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -1632,15 +1642,16 @@ static void curl_perform_test(const char *url, ssize_t expected_size) {
   curl_easy_cleanup(curl);
 
   curl_global_cleanup();
-  glr_destroy_allocator(&td.a);
+  glr_pop_allocator();
+  glr_destroy_transient_allocator(td.a);
   glr_cur_thread_runtime_cleanup();
   printf("%s:%d:%s %s DONE\n", __FILE__, __LINE__, __func__, url);
 }
 
 static void test_loggers() {
   printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   glr_error_t e = {};
 
@@ -1677,7 +1688,8 @@ static void test_loggers() {
   printf("%s:%d:%s Expected error %.*s\n", __FILE__, __LINE__, __func__, msg.len,
          msg.data);
 
-  glr_err_cleanup(&e);
+  e = (glr_error_t){};
+  //glr_err_cleanup(&e);
   const char *path = "/tmp/glr.log";
   unlink(path);
   struct glr_logger_t *file_logger = glr_logger_create(path, &e);
@@ -1726,7 +1738,7 @@ static void test_loggers() {
   glr_logger_destroy(file_logger);
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
 }
@@ -1738,13 +1750,14 @@ static void test_loggers_flush() {
   glr_log2(stderr_logger, GLR_LOG_LEVEL_TRACE, "These should be printed %d!!!", 123);
 
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+  glr_cur_thread_runtime_cleanup();
 }
 
 static void test_logging_context() {
   printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
 
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   glr_append_logging_context("user_id=%d;ip=%s;",123, "127.0.0.1");
   glr_log_info("Testing logging context");
@@ -1753,7 +1766,7 @@ static void test_logging_context() {
   glr_log_info("Testing logging context again");
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
@@ -1761,8 +1774,8 @@ static void test_logging_context() {
 
 static void test_logger_autoflush_on_high_levels() {
   printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   struct glr_logger_t *stdout_logger = glr_get_stdout_logger();
   glr_set_default_logger(stdout_logger);
@@ -1771,11 +1784,13 @@ static void test_logger_autoflush_on_high_levels() {
   glr_log_error("Serious error message");
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
 }
 
+//This test is not safe, function will catch all signals but not handle them
+#if 0
 void signal_handling_function(int signal, void *data) {
   printf("received signal %d data=%p on %ld\n", signal, data, syscall(SYS_gettid));
 }
@@ -1793,12 +1808,13 @@ static void test_signal_handling_thread() {
   glr_sleep(100);
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
 }
+#endif
 
 static void test_signalfd() {
   printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
 
-  glr_allocator_t a = glr_create_transient_allocator(NULL);
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   glr_error_t e = {};
 
@@ -1841,9 +1857,87 @@ static void test_signalfd() {
   glr_close(fd);
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
   glr_cur_thread_runtime_cleanup();
 
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
+static void test_combined_allocator_create_and_push() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+
+  glr_create_and_push_transient_allocator();
+
+  stringbuilder_t sb = glr_make_stringbuilder(256);
+  glr_stringbuilder_printf(&sb, "Hello %s", "world");
+  str_t s = glr_stringbuilder_build(&sb);
+  printf("%.*s\n", s.len, s.data);
+
+  glr_pop_and_destroy_transient_allocator();
+  glr_cur_thread_runtime_cleanup();
+
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
+static void test_implicit_transient_allocator() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+  glr_cur_thread_runtime_cleanup();
+
+  stringbuilder_t sb = glr_make_stringbuilder(256);
+  glr_stringbuilder_printf(&sb, "Hello %s", "world");
+  str_t s = glr_stringbuilder_build(&sb);
+  printf("%.*s\n", s.len, s.data);
+
+  glr_transient_allocator_t *a = glr_current_allocator();
+  if (a == NULL) {
+    abort();
+  }
+
+  glr_cur_thread_runtime_cleanup();
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
+static void test_implicit_transient_allocator2_fn(void *arg) {
+  (void) arg;
+  stringbuilder_t sb = glr_make_stringbuilder(256);
+  glr_stringbuilder_printf(&sb, "Hello %s from implicit allocator", "world");
+  str_t s = glr_stringbuilder_build(&sb);
+  printf("%.*s\n", s.len, s.data);
+}
+
+static void test_implicit_transient_allocator2() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+
+  glr_go(test_implicit_transient_allocator2_fn, NULL);
+  glr_scheduler_yield(1);
+
+  glr_cur_thread_runtime_cleanup();
+  printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
+}
+
+static void test_temporary_memory_area() {
+  printf("\n%s:%d:%s Started\n", __FILE__, __LINE__, __func__);
+  glr_cur_thread_runtime_cleanup();
+
+  for (int i = 0; i < 50; ++i) {
+    glr_temporary_area_bound_t temp_bound = glr_start_temporary_area();
+
+    stringbuilder_t sb = glr_make_stringbuilder(5000);
+    glr_stringbuilder_printf(&sb, "Hello %s", "world");
+    str_t s = glr_stringbuilder_build(&sb);
+    if (i % 47 == 0) {
+      printf("%.*s\n", s.len, s.data);
+    }
+
+    glr_reset_to_start_of_temporary_area(temp_bound);
+  }
+
+  glr_transient_allocator_t *a = glr_current_allocator();
+  if (a == NULL) {
+    abort();
+  }
+
+  glr_cur_thread_runtime_cleanup();
   printf("%s:%d:%s DONE\n", __FILE__, __LINE__, __func__);
 }
 
@@ -1852,14 +1946,14 @@ int main() {
   int dns_tests_enabled = 0;
   int curl_tests_enabled = 0;
   test_signalfd();
-  test_signal_handling_thread();
+//  test_signal_handling_thread();
 
   label_pointers();
   error_handling();
-  test_global_malloc_free_adapter();
+  //test_global_malloc_free_adapter();
   test_transient_allocator();
   test_glr_sprintf();
-  test_glr_malloc_free();
+  //test_glr_malloc_free();
   test_allocators_stack();
   test_stringbuilder();
   test_stringbuilder2();
@@ -1875,7 +1969,7 @@ int main() {
   test_scheduler_execution();
   test_poll();
   test_error_handling();
-  test_transient_allocator_embedding();
+  //test_transient_allocator_embedding();
   bench_transient_allocation();
   test_timers();
   test_allocator_preserving_between_coros();
@@ -1935,6 +2029,11 @@ int main() {
   test_loggers();
   test_logging_context();
   test_logger_autoflush_on_high_levels();
+
+  test_combined_allocator_create_and_push();
+  test_implicit_transient_allocator();
+  test_implicit_transient_allocator2();
+  test_temporary_memory_area();
 
   //these test should be last
   test_loggers_flush();

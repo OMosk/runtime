@@ -58,7 +58,8 @@ struct glr_exec_stack_t {
 struct glr_exec_context_t {
   void **sp;
   glr_exec_stack_t *stack;
-  glr_allocator_t *saved_allocator;
+  glr_transient_allocator_t *context_allocator;
+  glr_transient_allocator_t *current_allocator;
   glr_logger_t *logger;
   str_t logging_context;
 };
@@ -100,8 +101,7 @@ typedef struct glr_runtime_t {
   uint32_t timers_len;
 
   glr_exec_context_t thread_context;
-  glr_allocator_t *current_allocator;
-  glr_allocator_t cached_default_allocator;
+  //glr_transient_allocator_t *current_allocator;
 
   atomic_job_t *async_jobs_ringbuffer;
   uint32_t async_jobs_ringbuffer_cap;
@@ -128,30 +128,30 @@ typedef struct glr_runtime_t {
 //static thread_local glr_exec_context_t thread_context;
 static thread_local glr_runtime_t glr_runtime;
 
-// Global malloc/free allocator
-void *glr_malloc_free_adapter(void *data, int op, size_t size, size_t alignment, void *ptr) {
-  (void)data;
-  (void)alignment;
-
-  switch (op) {
-  case GLR_ALLOCATOR_ALLOC: {
-    return malloc(size);
-  }
-  case GLR_ALLOCATOR_FREE: {
-    free(ptr);
-  } break;
-  }
-
-  return NULL;
-}
-
-static glr_allocator_t glr_default_allocator = {
-  .data = NULL, .func = glr_malloc_free_adapter, .next = NULL
-};
-
-glr_allocator_t* glr_get_default_allocator() {
-  return &glr_default_allocator;
-}
+//// Global malloc/free allocator
+//void *glr_malloc_free_adapter(void *data, int op, size_t size, size_t alignment, void *ptr) {
+//  (void)data;
+//  (void)alignment;
+//
+//  switch (op) {
+//  case GLR_ALLOCATOR_ALLOC: {
+//    return malloc(size);
+//  }
+//  case GLR_ALLOCATOR_FREE: {
+//    free(ptr);
+//  } break;
+//  }
+//
+//  return NULL;
+//}
+//
+//static glr_allocator_t glr_default_allocator = {
+//  .data = NULL, .func = glr_malloc_free_adapter, .next = NULL
+//};
+//
+//glr_allocator_t* glr_get_default_allocator() {
+//  return &glr_default_allocator;
+//}
 
 // Transient allocator: alloc many times and clean it once in the end
 typedef struct {
@@ -162,10 +162,21 @@ typedef struct {
   uint32_t active_block_idx;
   uint32_t active_block_used;
 
-  glr_allocator_t *parent;
+  glr_transient_allocator_t *parent;
 } glr_transient_allocator;
 
-void glr_transient_allocator_alloc_block(glr_transient_allocator *a, size_t cap) {
+struct glr_transient_allocator_t {
+  glr_memory_block *blocks;
+  uint32_t len;
+  uint32_t cap;
+  uint32_t default_block_cap;
+  uint32_t active_block_idx;
+  uint32_t active_block_used;
+
+  glr_transient_allocator_t *next;
+};
+
+void glr_transient_allocator_alloc_block(glr_transient_allocator_t *a, size_t cap) {
   printf("!!!Allocating block\n");
   if (!a->cap || a->len == a->cap) {
     uint32_t new_cap = a->cap * 2;
@@ -176,22 +187,25 @@ void glr_transient_allocator_alloc_block(glr_transient_allocator *a, size_t cap)
     uint32_t old_blocks_cap = a->cap;
     glr_memory_block *old_blocks = a->blocks;
 
-    a->blocks = (glr_memory_block *)glr_allocator_alloc(
-        a->parent, new_cap * sizeof(glr_memory_block),
-        alignof(glr_memory_block));
+    a->blocks = (glr_memory_block *)malloc(new_cap * sizeof(glr_memory_block));
+//    a->blocks = (glr_memory_block *)glr_allocator_alloc(
+//        a->parent, new_cap * sizeof(glr_memory_block),
+//        alignof(glr_memory_block));
     a->cap = new_cap;
 
     memcpy(a->blocks, old_blocks, old_blocks_cap * sizeof(glr_memory_block));
-    glr_allocator_free(a->parent, old_blocks);
+    free(old_blocks);
+    //glr_allocator_free(a->parent, old_blocks);
   }
 
   a->blocks[a->len].cap = cap;
-  a->blocks[a->len].data = glr_allocator_alloc(a->parent, cap, 16);
+  a->blocks[a->len].data = malloc(cap);
+  //a->blocks[a->len].data = glr_allocator_alloc(a->parent, cap, 16);
   a->len++;
 }
 
 void glr_transient_allocator_use_next_block(
-    glr_transient_allocator *a, size_t min_size) {
+    glr_transient_allocator_t *a, size_t min_size) {
 
   if (!a->len || a->active_block_idx + 1 == a->len) {
     //no free allocated blocks
@@ -220,128 +234,219 @@ void glr_transient_allocator_use_next_block(
 }
 
 
-void *glr_transient_allocator_func(
-    void *data, int op, size_t size, size_t alignment, void *ptr) {
-  (void)ptr;
-  glr_transient_allocator *a = (glr_transient_allocator *) data;
+//void *glr_transient_allocator_func(
+//    void *data, int op, size_t size, size_t alignment, void *ptr) {
+//  (void)ptr;
+//  glr_transient_allocator *a = (glr_transient_allocator *) data;
+//
+//  switch (op) {
+//  case GLR_ALLOCATOR_ALLOC: {
+//    if (!a->len) {
+//      glr_transient_allocator_use_next_block(a, size);
+//    }
+//
+//    glr_memory_block *block = a->blocks + a->active_block_idx;
+//
+//    char *block_begin = (char *)block->data;
+//    char *cur_pos = block_begin + a->active_block_used;
+//    char *block_end = block_begin + block->cap;
+//
+//    if ((uintptr_t)cur_pos % alignment) {
+//      size_t shift_to_match_aligment = (alignment - (uintptr_t)cur_pos % alignment);
+//      cur_pos += shift_to_match_aligment;
+//      a->active_block_used += shift_to_match_aligment;
+//    }
+//
+//    if (block_end - cur_pos < (long)size) {
+//      glr_transient_allocator_use_next_block(a, size);
+//
+//      block = a->blocks + a->active_block_idx;
+//      block_begin = (char *)block->data;
+//      cur_pos = block_begin + a->active_block_used;
+//      block_end = block_begin + block->cap;
+//    }
+//
+//    void *result = cur_pos;
+//    a->active_block_used += size;
+//    return result;
+//  } break;
+//  case GLR_ALLOCATOR_FREE: {
+//  } break;
+//  case GLR_ALLOCATOR_RESET: {
+//    a->active_block_idx = 0;
+//    a->active_block_used = 0;
+//  } break;
+//  case GLR_ALLOCATOR_DESTROY: {
+//    for (uint32_t block_idx = 0; block_idx < a->len; ++block_idx) {
+//      glr_allocator_free(a->parent, a->blocks[block_idx].data);
+//    }
+//    glr_allocator_free(a->parent, a->blocks);
+//    glr_allocator_free(a->parent, a);
+//  } break;
+//  }
+//
+//  return NULL;
+//}
 
-  switch (op) {
-  case GLR_ALLOCATOR_ALLOC: {
-    if (!a->len) {
-      glr_transient_allocator_use_next_block(a, size);
-    }
-
-    glr_memory_block *block = a->blocks + a->active_block_idx;
-
-    char *block_begin = (char *)block->data;
-    char *cur_pos = block_begin + a->active_block_used;
-    char *block_end = block_begin + block->cap;
-
-    if ((uintptr_t)cur_pos % alignment) {
-      size_t shift_to_match_aligment = (alignment - (uintptr_t)cur_pos % alignment);
-      cur_pos += shift_to_match_aligment;
-      a->active_block_used += shift_to_match_aligment;
-    }
-
-    if (block_end - cur_pos < (long)size) {
-      glr_transient_allocator_use_next_block(a, size);
-
-      block = a->blocks + a->active_block_idx;
-      block_begin = (char *)block->data;
-      cur_pos = block_begin + a->active_block_used;
-      block_end = block_begin + block->cap;
-    }
-
-    void *result = cur_pos;
-    a->active_block_used += size;
-    return result;
-  } break;
-  case GLR_ALLOCATOR_FREE: {
-  } break;
-  case GLR_ALLOCATOR_RESET: {
-    a->active_block_idx = 0;
-    a->active_block_used = 0;
-  } break;
-  case GLR_ALLOCATOR_DESTROY: {
-    for (uint32_t block_idx = 0; block_idx < a->len; ++block_idx) {
-      glr_allocator_free(a->parent, a->blocks[block_idx].data);
-    }
-    glr_allocator_free(a->parent, a->blocks);
-    glr_allocator_free(a->parent, a);
-  } break;
-  }
-
-  return NULL;
+glr_transient_allocator_t *glr_create_transient_allocator_detailed(uint32_t block_cap_in_4k_pages) {
+  glr_transient_allocator_t *allocator
+    = (glr_transient_allocator_t *) malloc(sizeof(glr_transient_allocator_t));
+  *allocator = (glr_transient_allocator_t){};
+  allocator->default_block_cap = 4096 * block_cap_in_4k_pages;
+  return allocator;
 }
 
-glr_allocator_t glr_create_transient_allocator(glr_allocator_t *parent) {
-  if (!parent) {
-    parent = glr_current_allocator();
+glr_transient_allocator_t *glr_create_transient_allocator() {
+  return glr_create_transient_allocator_detailed(1);
+}
+
+void glr_destroy_transient_allocator(glr_transient_allocator_t *a) {
+  for (uint32_t block_idx = 0; block_idx < a->len; ++block_idx) {
+    free(a->blocks[block_idx].data);
   }
-  glr_allocator_t result = {};
+  free(a->blocks);
+  free(a);
+}
 
-  glr_transient_allocator *tmp = (glr_transient_allocator *)glr_allocator_alloc(
-      parent, sizeof(glr_transient_allocator),
-      alignof(glr_transient_allocator));
-  *tmp = (glr_transient_allocator){};
+void glr_reset_transient_allocator(glr_transient_allocator_t *a) {
+  a->active_block_idx = 0;
+  a->active_block_used = 0;
+}
 
-  tmp->default_block_cap = 4096;
-  tmp->parent = parent;
-  result.func = glr_transient_allocator_func;
-  result.data = tmp;
+void *glr_alloc_from_transient_allocator(glr_transient_allocator_t *a, uint32_t size, uint32_t alignment) {
+  if (!a->len) {
+    glr_transient_allocator_use_next_block(a, size);
+  }
 
+  glr_memory_block *block = a->blocks + a->active_block_idx;
+
+  char *block_begin = (char *)block->data;
+  char *cur_pos = block_begin + a->active_block_used;
+  char *block_end = block_begin + block->cap;
+
+  if ((uintptr_t)cur_pos % alignment) {
+    size_t shift_to_match_aligment = (alignment - (uintptr_t)cur_pos % alignment);
+    cur_pos += shift_to_match_aligment;
+    a->active_block_used += shift_to_match_aligment;
+  }
+
+  if (block_end - cur_pos < (long)size) {
+    glr_transient_allocator_use_next_block(a, size);
+
+    block = a->blocks + a->active_block_idx;
+    block_begin = (char *)block->data;
+    cur_pos = block_begin + a->active_block_used;
+    block_end = block_begin + block->cap;
+  }
+
+  void *result = cur_pos;
+  a->active_block_used += size;
   return result;
 }
+
+
+//glr_allocator_t glr_create_transient_allocator(glr_allocator_t *parent) {
+//  if (!parent) {
+//    parent = glr_current_allocator();
+//  }
+//  glr_allocator_t result = {};
+//
+//  glr_transient_allocator *tmp = (glr_transient_allocator *)glr_allocator_alloc(
+//      parent, sizeof(glr_transient_allocator),
+//      alignof(glr_transient_allocator));
+//  *tmp = (glr_transient_allocator){};
+//
+//  tmp->default_block_cap = 4096;
+//  tmp->parent = parent;
+//  result.func = glr_transient_allocator_func;
+//  result.data = tmp;
+//
+//  return result;
+//}
 
 //Common for all allocators
-void *glr_allocator_alloc(glr_allocator_t *a, size_t size,
-                             size_t alignment) {
-  return a->func(a->data, GLR_ALLOCATOR_ALLOC, size, alignment, NULL);
+//void *glr_allocator_alloc(glr_allocator_t *a, size_t size,
+//                             size_t alignment) {
+//  return a->func(a->data, GLR_ALLOCATOR_ALLOC, size, alignment, NULL);
+//}
+//
+//void glr_allocator_free(glr_allocator_t *a, void *ptr) {
+//  a->func(a->data, GLR_ALLOCATOR_FREE, 0, 0, ptr);
+//}
+//
+//void glr_reset_allocator(glr_allocator_t *a) {
+//  a->func(a->data, GLR_ALLOCATOR_RESET, 0, 0, NULL);
+//}
+//
+//void glr_destroy_allocator(glr_allocator_t *a) {
+//  a->func(a->data, GLR_ALLOCATOR_DESTROY, 0, 0, NULL);
+//}
+
+void glr_push_allocator(glr_transient_allocator_t *a) {
+  glr_exec_context_t *ctx = glr_current_context();
+  a->next = ctx->current_allocator;
+  ctx->current_allocator = a;
+//  a->next = glr_runtime.current_allocator;
+//  glr_runtime.current_allocator = a;
 }
 
-void glr_allocator_free(glr_allocator_t *a, void *ptr) {
-  a->func(a->data, GLR_ALLOCATOR_FREE, 0, 0, ptr);
+glr_transient_allocator_t *glr_create_and_push_transient_allocator() {
+  glr_transient_allocator_t *r = glr_create_transient_allocator();
+  glr_push_allocator(r);
+  return r;
 }
 
-void glr_reset_allocator(glr_allocator_t *a) {
-  a->func(a->data, GLR_ALLOCATOR_RESET, 0, 0, NULL);
+glr_transient_allocator_t *glr_create_and_push_transient_allocator_detailed(uint32_t block_cap_in_4k_pages) {
+  glr_transient_allocator_t *r = glr_create_transient_allocator_detailed(block_cap_in_4k_pages);
+  glr_push_allocator(r);
+  return r;
 }
 
-void glr_destroy_allocator(glr_allocator_t *a) {
-  a->func(a->data, GLR_ALLOCATOR_DESTROY, 0, 0, NULL);
+glr_transient_allocator_t *glr_pop_and_destroy_transient_allocator() {
+  glr_transient_allocator_t *r = glr_pop_allocator();
+  glr_destroy_transient_allocator(r);
+  return r;
 }
 
-void glr_push_allocator(glr_allocator_t *a) {
-  a->next = glr_runtime.current_allocator;
-  glr_runtime.current_allocator = a;
-}
-
-glr_allocator_t* glr_pop_allocator() {
-  glr_allocator_t *result = glr_runtime.current_allocator;
-  glr_runtime.current_allocator = glr_runtime.current_allocator->next;
+glr_transient_allocator_t* glr_pop_allocator() {
+  glr_exec_context_t *ctx = glr_current_context();
+  glr_transient_allocator_t *result = ctx->current_allocator;
+  ctx->current_allocator = ctx->current_allocator->next;
   return result;
 }
 
-glr_allocator_t* glr_current_allocator() {
-  if (!glr_runtime.current_allocator) {
-    if (!glr_runtime.cached_default_allocator.func) {
-      glr_runtime.cached_default_allocator = *glr_get_default_allocator();
+glr_transient_allocator_t* glr_current_allocator() {
+  glr_exec_context_t *ctx = glr_current_context();
+  if (!ctx->current_allocator) {
+    if (!ctx->context_allocator) {
+      ctx->context_allocator = glr_create_transient_allocator();
     }
-    glr_runtime.current_allocator = &glr_runtime.cached_default_allocator;
+    ctx->current_allocator = ctx->context_allocator;
   }
 
-  return glr_runtime.current_allocator;
+  return ctx->current_allocator;
 }
 
-void *glr_malloc(size_t size, size_t alignment) {
-  return glr_allocator_alloc(glr_current_allocator(), size, alignment);
+glr_temporary_area_bound_t glr_start_temporary_area() {
+  glr_transient_allocator_t *a = glr_current_allocator();
+  glr_temporary_area_bound_t result;
+  result.a = a;
+  result.block_idx = a->active_block_idx;
+  result.block_used = a->active_block_used;
+  return result;
 }
 
-void glr_free(void *data) {
-  return glr_allocator_free(glr_current_allocator(), data);
+void glr_reset_to_start_of_temporary_area(glr_temporary_area_bound_t bound) {
+  glr_transient_allocator_t *a = glr_current_allocator();
+  if (a != bound.a) {
+    glr_log_crit("attempt to reset temporary memory area: current allocator and bound allocator are not same");
+    abort();
+  }
+  a->active_block_idx = bound.block_idx;
+  a->active_block_used = bound.block_used;
 }
 
-str_t glr_sprintf_ex(glr_allocator_t *a, const char *format, ...) {
+str_t glr_sprintf_ex(glr_transient_allocator_t *a, const char *format, ...) {
   va_list args;
   va_start(args, format);
 
@@ -349,7 +454,7 @@ str_t glr_sprintf_ex(glr_allocator_t *a, const char *format, ...) {
 
   str_t result = {};
   result.cap = len + 1;
-  result.data = glr_allocator_alloc(a, result.cap, alignof(char));
+  result.data = glr_alloc_from_transient_allocator(a, result.cap, alignof(char));
 
   va_end(args);
   va_start(args, format);
@@ -388,15 +493,17 @@ void glr_stringbuilder_alloc_block(stringbuilder_t *sb, size_t cap) {
     uint32_t old_blocks_cap = sb->cap;
     str_t *old_blocks = sb->blocks;
 
-    sb->blocks = (str_t *) glr_malloc(new_cap * sizeof(str_t), alignof(str_t));
+    //sb->blocks = (str_t *) glr_malloc(new_cap * sizeof(str_t), alignof(str_t));
+    sb->blocks = GLR_ALLOCATE_ARRAY(str_t, new_cap);
     sb->cap = new_cap;
 
     memcpy(sb->blocks, old_blocks, old_blocks_cap * sizeof(str_t));
-    glr_free(old_blocks);
+    //glr_free(old_blocks);
   }
 
   sb->blocks[sb->len].cap = cap;
-  sb->blocks[sb->len].data = glr_malloc(cap, 1);
+  //sb->blocks[sb->len].data = glr_malloc(cap, 1);
+  sb->blocks[sb->len].data = GLR_ALLOCATE_ARRAY(char, cap);
   sb->blocks[sb->len].len = 0;
   sb->len++;
 }
@@ -499,7 +606,8 @@ str_t glr_stringbuilder_build(stringbuilder_t *sb) {
 
   str_t result = {};
   result.cap = needed_cap + 1;
-  result.data = glr_malloc(result.cap, 1);
+  //result.data = glr_malloc(result.cap, 1);
+  result.data = GLR_ALLOCATE_ARRAY(char, result.cap);
 
   for (uint32_t i = 0; i <= sb->active_block_idx; ++i) {
     memcpy(result.data + result.len, sb->blocks[i].data, sb->blocks[i].len);
@@ -511,12 +619,12 @@ str_t glr_stringbuilder_build(stringbuilder_t *sb) {
   return result;
 }
 
-void glr_stringbuilder_free_buffers(stringbuilder_t *sb) {
-  for (uint32_t i = 0; i < sb->len; ++i) {
-    glr_free(sb->blocks[i].data);
-  }
-  glr_free(sb->blocks);
-}
+//void glr_stringbuilder_free_buffers(stringbuilder_t *sb) {
+//  for (uint32_t i = 0; i < sb->len; ++i) {
+//    glr_free(sb->blocks[i].data);
+//  }
+//  glr_free(sb->blocks);
+//}
 
 void glr_stringbuilder_reset(stringbuilder_t *sb) {
   for (uint32_t i = 0; i < sb->len; ++i) {
@@ -599,15 +707,6 @@ void glr_cur_thread_runtime_cleanup() {
 
   for (uint32_t i = 0; i < r->free_contexts_len; ++i) {
     glr_exec_context_t *ctx = r->free_contexts[i];
-    /*
-     * FIXME: currently it does not work properly and cause tests to segfault
-    glr_allocator_t *allocator_it = ctx->saved_allocator;
-    while (allocator_it) {
-      glr_allocator_t *tmp = allocator_it;
-      allocator_it = allocator_it->next;
-      glr_destroy_allocator(tmp);
-    }
-    */
     glr_exec_context_cleanup(ctx, &ss);
   }
   free(r->free_contexts);
@@ -633,6 +732,14 @@ void glr_cur_thread_runtime_cleanup() {
     curl_multi_cleanup(r->curl_multi_handle);
   }
 #endif
+  glr_exec_context_t *ctxs[] = {r->cur_context, &r->thread_context};
+  for (uint32_t i = 0; i < sizeof(ctxs)/sizeof(ctxs[0]); ++i) {
+    glr_exec_context_t *ctx = ctxs[i];
+    if (ctx && ctx->context_allocator) {
+      glr_destroy_transient_allocator(ctx->context_allocator);
+      ctx->context_allocator = NULL;
+    }
+  }
 
   *r = (glr_runtime_t) {};
 }
@@ -649,6 +756,8 @@ void glr_preallocate_contexts(size_t count) {
   for (size_t i = 0; i < count; ++i) {
     glr_exec_context_t *result = NULL;
     result = malloc(sizeof(glr_exec_context_t));
+    result->context_allocator = NULL;
+    result->current_allocator = NULL;
     result->stack = malloc(sizeof(glr_exec_stack_t));
     stack_size_t ss = get_stack_size();
     result->stack->size = ss.usable;
@@ -677,7 +786,8 @@ glr_exec_context_t *glr_get_context_from_freelist() {
   glr_runtime.free_contexts[0] =
       glr_runtime.free_contexts[glr_runtime.free_contexts_len - 1];
   glr_runtime.free_contexts_len--;
-  result->saved_allocator = NULL;
+  result->context_allocator = NULL;
+  result->current_allocator = NULL;
   result->logger = NULL;
   result->logging_context = (str_t){};
   return result;
@@ -697,6 +807,9 @@ void glr_put_context_to_freelist(glr_exec_context_t *context) {
     free(old_arr);
     r->free_contexts_cap = new_cap;
     r->free_contexts = new_arr;
+  }
+  if (context->context_allocator) {
+    glr_destroy_transient_allocator(context->context_allocator);
   }
   r->free_contexts[r->free_contexts_len] = context;
   r->free_contexts_len++;
@@ -751,8 +864,6 @@ asm("\t.text\n"
 );
 
 void glr_transfer(glr_exec_context_t *prev, glr_exec_context_t *next) {
-  prev->saved_allocator = glr_runtime.current_allocator;
-  glr_runtime.current_allocator = next->saved_allocator;
   glr_runtime.cur_context = next;
   glr_coro_transfer(prev, next);
 }
@@ -852,11 +963,11 @@ void glr_scheduler_yield(int reschedule_current_ctx) {
 
   glr_transfer(cur_ctx, next_ctx);
 }
-//error handling
-inline void glr_err_cleanup(glr_error_t *err) {
-  glr_stringbuilder_free_buffers(&err->msg);
-  *err = (glr_error_t) {};
-}
+// //error handling
+// inline void glr_err_cleanup(glr_error_t *err) {
+//   glr_stringbuilder_free_buffers(&err->msg);
+//   *err = (glr_error_t) {};
+// }
 
 const char *glr_posix_error = "GLR_POSIX_ERROR";
 
@@ -1318,7 +1429,7 @@ str_t glr_addr_to_string(const struct sockaddr_storage *addr) {
     }
     glr_stringbuilder_printf(&sb, ":%u", port);
     str_t result = glr_stringbuilder_build(&sb);
-    glr_stringbuilder_free_buffers(&sb);
+    //glr_stringbuilder_free_buffers(&sb);
     return result;
   } break;
   case AF_UNIX: {
@@ -1334,7 +1445,7 @@ str_t glr_addr_to_string(const struct sockaddr_storage *addr) {
     glr_stringbuilder_append(&sb, path, strlen(path));
 
     str_t result = glr_stringbuilder_build(&sb);
-    glr_stringbuilder_free_buffers(&sb);
+    //glr_stringbuilder_free_buffers(&sb);
     return result;
   } break;
   default:
@@ -1822,7 +1933,7 @@ static int glr_ssl_bio_write(BIO *bio, const char *data, int len) {
   glr_error_t err = {};
   int n = glr_fd_raw_send(conn, data, len, &err);
   if (err.error) {
-    glr_err_cleanup(&err);
+    //glr_err_cleanup(&err);
     return -1;
     //TODO: logging or error forwarding via glr_fd_t*
   }
@@ -1834,7 +1945,7 @@ static int glr_ssl_bio_read(BIO *bio, char *data, int len) {
   glr_error_t err = {};
   int n = glr_fd_raw_recv(conn, data, len, &err);
   if (err.error) {
-    glr_err_cleanup(&err);
+    //glr_err_cleanup(&err);
     return -1;
     //TODO: logging or error forwarding via glr_fd_t*
   }
@@ -1901,7 +2012,7 @@ void glr_ssl_client_conn_handshake(SSL_CTX *ctx, glr_fd_t *conn,
     glr_stringbuilder_printf(&err->msg,
                              "%s:%d:%s SSL_do_handshake failed: %.*s", __FILE__,
                              __LINE__, __func__, err_str.len, err_str.data);
-    glr_free(err_str.data);
+    //glr_free(err_str.data);
     return;
   }
 }
@@ -1923,7 +2034,7 @@ void glr_ssl_server_conn_upgrade(SSL_CTX *ctx, glr_fd_t *conn, int64_t deadline,
     glr_stringbuilder_printf(&err->msg,
                              "%s:%d:%s SSL_do_handshake failed: %.*s", __FILE__,
                              __LINE__, __func__, err_str.len, err_str.data);
-    glr_free(err_str.data);
+    //glr_free(err_str.data);
     return;
   }
 }
@@ -1945,7 +2056,7 @@ int glr_ssl_read(glr_fd_t *impl, char *buffer, size_t len, glr_error_t *err) {
         glr_stringbuilder_printf(
             &err->msg, "%s:%d:%s SSL_read failed: %.*s", __FILE__,
             __LINE__, __func__, err_str.len, err_str.data);
-        glr_free(err_str.data);
+        //glr_free(err_str.data);
         return 0;
       }
     }
@@ -1968,7 +2079,7 @@ int glr_ssl_write(glr_fd_t *impl, const char *buffer, size_t len, glr_error_t *e
         glr_stringbuilder_printf(
             &err->msg, "%s:%d:%s SSL_write failed: %.*s", __FILE__,
             __LINE__, __func__, err_str.len, err_str.data);
-        glr_free(err_str.data);
+        //glr_free(err_str.data);
         return 0;
       }
     }
@@ -2285,7 +2396,7 @@ void glr_logger_destroy(struct glr_logger_t *logger) {
   pthread_mutex_unlock(&glr_log_flusher_list_mtx);
 
   pthread_mutex_destroy(&logger->mtx);
-  glr_free(logger);
+  //glr_free(logger);
 }
 
 str_t glr_log_level_trace_str   = GLR_STR_LITERAL("[trace]");
@@ -2350,8 +2461,14 @@ void glr_log_start_flusher_thread_fn() {
                  NULL);
 }
 
+void glr_log_stop_flusher_thread() {
+  glr_log_flusher_thread_should_stop = 1;
+  pthread_join(glr_log_flusher_thread, NULL);
+  glr_log_flusher_thread_is_iniitialized = PTHREAD_ONCE_INIT;
+}
+
 void glr_log_cleanup_atexit_fn() {
-  glr_flush_logs();
+  glr_log_stop_flusher_thread();
 }
 
 void glr_log_cleanup_atexit_once_setup_fn() {
@@ -2366,20 +2483,14 @@ void glr_log_start_flusher_thread() {
                glr_log_cleanup_atexit_once_setup_fn);
 }
 
-void glr_log_stop_flusher_thread() {
-  glr_log_flusher_thread_should_stop = 1;
-  pthread_join(glr_log_flusher_thread, NULL);
-  glr_log_flusher_thread_is_iniitialized = PTHREAD_ONCE_INIT;
-}
-
 void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
                       cstr_t source_location, cstr_t function_name,
                       const char *format, ...) {
   if (logger->min_level > level) {
     return;
   }
-  glr_allocator_t a = glr_create_transient_allocator(glr_get_default_allocator());
-  glr_push_allocator(&a);
+  glr_transient_allocator_t *a = glr_create_transient_allocator();
+  glr_push_allocator(a);
 
   char datetime_buffer[128];
   int64_t ts_in_milliseconds = glr_timestamp_in_ms();
@@ -2452,7 +2563,7 @@ void glr_log_detailed(glr_logger_t *logger, glr_log_level_t level,
   pthread_mutex_unlock(&logger->mtx);
 
   glr_pop_allocator();
-  glr_destroy_allocator(&a);
+  glr_destroy_transient_allocator(a);
 }
 
 str_t glr_get_logging_context() {

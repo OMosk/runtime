@@ -1,5 +1,4 @@
 TODO:
-- simplify memory allocation stack
 - OpenSSL via dlopen
 - nonblocking dns (getaddrinfo_a dlopen)
 - compile time configurations of glr constraints
@@ -14,5 +13,8 @@ TODO:
 - SNI for ssl servers
 - implement or integrate websockets
 - subprocess execution
-- MySQL driver
-
+- implement MySQL driver
+- Multi file test with external validation for log flushing, signal handling
+- implement log flusher thread wakeup at exit to avoid waiting N-sec period
+- improve transient memory allocation in case if request memory size is larger than block capasity
+  by rearranging blocks in blocks array to avoid large holes

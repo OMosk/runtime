@@ -20,29 +20,37 @@
 #endif
 
 
-enum {
-  GLR_ALLOCATOR_ALLOC,
-  GLR_ALLOCATOR_FREE,
-  GLR_ALLOCATOR_RESET,
-  GLR_ALLOCATOR_DESTROY,
-};
+//enum {
+//  GLR_ALLOCATOR_ALLOC,
+//  GLR_ALLOCATOR_FREE,
+//  GLR_ALLOCATOR_RESET,
+//  GLR_ALLOCATOR_DESTROY,
+//};
+//
+//typedef void* (glr_allocator_function)(
+//    void *allocator_data, int op, size_t size, size_t alignment, void *ptr);
+//
+//typedef struct glr_allocator_s {
+//  void *data;
+//  glr_allocator_function *func;
+//  struct glr_allocator_s *next;
+//} glr_allocator_t;
+//
+//void *glr_allocator_alloc(glr_allocator_t *a, size_t size, size_t alignment);
+//void glr_allocator_free(glr_allocator_t *a, void *ptr);
+//void glr_reset_allocator(glr_allocator_t *a);
+//void glr_destroy_allocator(glr_allocator_t *a);
 
-typedef void* (glr_allocator_function)(
-    void *allocator_data, int op, size_t size, size_t alignment, void *ptr);
+//glr_allocator_t* glr_get_default_allocator();
+//glr_allocator_t glr_create_transient_allocator(glr_allocator_t *parent);
 
-typedef struct glr_allocator_s {
-  void *data;
-  glr_allocator_function *func;
-  struct glr_allocator_s *next;
-} glr_allocator_t;
+typedef struct glr_transient_allocator_t glr_transient_allocator_t;
 
-void *glr_allocator_alloc(glr_allocator_t *a, size_t size, size_t alignment);
-void glr_allocator_free(glr_allocator_t *a, void *ptr);
-void glr_reset_allocator(glr_allocator_t *a);
-void glr_destroy_allocator(glr_allocator_t *a);
-
-glr_allocator_t* glr_get_default_allocator();
-glr_allocator_t glr_create_transient_allocator(glr_allocator_t *parent);
+glr_transient_allocator_t *glr_create_transient_allocator();
+glr_transient_allocator_t *glr_create_transient_allocator_detailed(uint32_t block_cap_in_4k_pages);
+void *glr_alloc_from_transient_allocator(glr_transient_allocator_t *a, uint32_t size, uint32_t alignment);
+void glr_reset_transient_allocator(glr_transient_allocator_t *a);
+void glr_destroy_transient_allocator(glr_transient_allocator_t *a);
 
 typedef struct {
   void *data;
@@ -62,7 +70,7 @@ typedef struct {
   uint32_t cap;
 } str_t;
 
-str_t glr_sprintf_ex(glr_allocator_t *a, const char *format, ...)
+str_t glr_sprintf_ex(glr_transient_allocator_t *a, const char *format, ...)
   __attribute__((format(printf, 2, 3)));
 
 #define glr_sprintf(...) glr_sprintf_ex(glr_current_allocator(), __VA_ARGS__)
@@ -74,14 +82,27 @@ str_t glr_strdup(str_t s);
 #define GLR_STR_LITERAL(s) ((str_t){(s), sizeof(s) - 1, sizeof(s) - 1})
 #define GLR_STRDUP_LITERAL(s) (glr_strdup(GLR_STR_LITERAL(s)))
 
-void glr_push_allocator(glr_allocator_t *a);
-glr_allocator_t* glr_pop_allocator(void);
-glr_allocator_t* glr_current_allocator(void);
+void glr_push_allocator(glr_transient_allocator_t *a);
+glr_transient_allocator_t* glr_pop_allocator(void);
+glr_transient_allocator_t* glr_current_allocator(void);
 
-void *glr_malloc(size_t size, size_t alignment);
-#define GLR_ALLOCATE_TYPE(T) ((T*) glr_malloc(sizeof(T), alignof(T)))
-#define GLR_ALLOCATE_ARRAY(T, n) ((T*) glr_malloc(sizeof(T)*(n), alignof(T)))
-void glr_free(void *data);
+glr_transient_allocator_t *glr_create_and_push_transient_allocator();
+glr_transient_allocator_t *glr_create_and_push_transient_allocator_detailed(uint32_t block_cap_in_4k_pages);
+glr_transient_allocator_t *glr_pop_and_destroy_transient_allocator();
+
+typedef struct {
+  glr_transient_allocator_t *a;
+  uint32_t block_idx;
+  uint32_t block_used;
+} glr_temporary_area_bound_t;
+
+glr_temporary_area_bound_t glr_start_temporary_area();
+void glr_reset_to_start_of_temporary_area(glr_temporary_area_bound_t bound);
+
+//void *glr_malloc(size_t size, size_t alignment);
+#define GLR_ALLOCATE_TYPE(T) ((T*) glr_alloc_from_transient_allocator(glr_current_allocator(), sizeof(T), alignof(T)))
+#define GLR_ALLOCATE_ARRAY(T, n) ((T*) glr_alloc_from_transient_allocator(glr_current_allocator(), sizeof(T)*(n), alignof(T)))
+//void glr_free(void *data);
 
 typedef struct {
   str_t *blocks;
@@ -102,7 +123,7 @@ void glr_stringbuilder_append2(stringbuilder_t *sb, const str_t s);
 
 str_t glr_stringbuilder_build(stringbuilder_t *sb);
 void glr_stringbuilder_reset(stringbuilder_t *sb);
-void glr_stringbuilder_free_buffers(stringbuilder_t *sb);
+//void glr_stringbuilder_free_buffers(stringbuilder_t *sb);
 
 //coroutines
 
@@ -136,7 +157,7 @@ typedef struct {
   stringbuilder_t msg;
 } glr_error_t;
 
-void glr_err_cleanup(glr_error_t *err);
+//void glr_err_cleanup(glr_error_t *err);
 #define glr_err_printf(err, ...) glr_stringbuilder_printf(&((err)->msg), __VA_ARGS__)
 
 extern const char *glr_posix_error;
